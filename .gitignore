@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Caché de ejecución del árbol de decisión (picas_fijas3.py / benchmark)
+Picas_y_Fijas/arbol_picas_fijas.json
