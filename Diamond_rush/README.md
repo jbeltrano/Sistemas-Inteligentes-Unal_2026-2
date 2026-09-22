@@ -1,1 +1,3 @@
 La idea principal, es hacer un agente, capaz de jugar cualuquiera de los 20 niveles del videojuego de este enlace: https://www.minijuegos.com/juego/diamond-rush
+
+https://www.minijuegos.com/embed/diamond-rush

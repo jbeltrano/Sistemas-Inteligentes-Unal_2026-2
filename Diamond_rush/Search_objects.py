@@ -1,6 +1,70 @@
 import cv2
 from pathlib import Path
+from random import random
 
+class MatchTemplate:
+    
+    def __init__(self, template_path, imagen):
+        self.imagen = imagen
+        self.template_path = template_path
+        
+        self.template_image = cv2.imread(str(self.template_path))
+        self.check_images_exist(self.template_image, self.template_path)
+        
+        self.get_template_size()
+        
+        
+    @staticmethod
+    def check_images_exist(imagen, path):
+        if imagen is None:
+            raise FileNotFoundError(
+                f"No se pudo cargar la imagen: {path}"
+            )
+    
+    def get_template_size(self):
+        h, w = self.template_image.shape[:2]
+        print(f"Template: {w}x{h}")
+        return h, w
+    
+    def match_template(self, threshold=0.80, solape_max=None):
+        if solape_max is None:
+            solape_max = SOLAPE_MAX
+        resultado = cv2.matchTemplate(
+            self.imagen,
+            self.template_image,
+            cv2.TM_CCOEFF_NORMED
+        )
+        
+        ys, xs = (resultado >= threshold).nonzero()
+        scores = resultado[ys, xs]
+        h, w = self.get_template_size()
+        
+        # NMS: quedarse con una sola caja por objeto
+        # (matchTemplate deja una "meseta" de píxeles sobre el umbral alrededor de cada coincidencia)
+        candidatos = sorted(
+            zip(xs, ys, scores),
+            key=lambda p: p[2],
+            reverse=True
+        )
+        
+        elegidos = []
+        for x, y, _ in candidatos:
+            if all(
+                self._sobrelape(x, y, ex, ey, w, h) <= solape_max
+                for ex, ey in elegidos
+            ):
+                elegidos.append((x, y))
+        
+        xs, ys = zip(*elegidos) if elegidos else ([], [])
+        print(f"Coincidencias encontradas: {len(elegidos)}")
+        
+        return list(xs), list(ys)
+    
+    def _sobrelape(self, x, y, dx, dy, w, h):
+        ancho = max(0, min(x + w, dx + w) - max(x, dx))
+        alto  = max(0, min(y + h, dy + h) - max(y, dy))
+        return (ancho * alto) / (w * h)
+    
 # ==========================================
 # CONFIGURACIÓN
 # ==========================================
@@ -9,91 +73,78 @@ BASE_DIR = Path(__file__).resolve().parent
 
 imagen_path = BASE_DIR / "captura.png"
 template_path = BASE_DIR / "templates" / "personaje.png"
-template_path = BASE_DIR / "templates" / "diamond.png"
-template_path = BASE_DIR / "templates" / "door_key.png"
-template_path = BASE_DIR / "templates" / "hueco.png"
+personaje_path = BASE_DIR / "templates" / "personaje.png"
+diamond_path = BASE_DIR / "templates" / "diamond.png"
+door_key_path = BASE_DIR / "templates" / "door_key.png"
+hueco_path = BASE_DIR / "templates" / "hueco.png"
+key_path = BASE_DIR / "templates" / "key.png"
+pic_path = BASE_DIR / "templates" / "pic.png"
+rock_in_path = BASE_DIR / "templates" / "rock_in.png"
+rock_path = BASE_DIR / "templates" / "rock.png"
+scape_block_path = BASE_DIR / "templates" / "scape_block.png"
+space_enable_path = BASE_DIR / "templates" / "scape_enable.png"
+no_picos_path = BASE_DIR / "templates" / "no_picos.png"
 
 UMBRAL = 0.80
 
-
-# ==========================================
-# CARGAR IMÁGENES
-# ==========================================
+# Fracción máxima del área del template que dos coincidencias pueden compartir
+# antes de considerarse la misma meseta (0 = nada, 1 = todo)
+SOLAPE_MAX = 0.4
 
 imagen = cv2.imread(str(imagen_path))
-template = cv2.imread(str(template_path))
+MatchTemplate.check_images_exist(imagen, imagen_path)
 
-if imagen is None:
-    raise FileNotFoundError(
-        f"No se pudo cargar la imagen: {imagen_path}"
-    )
-
-if template is None:
-    raise FileNotFoundError(
-        f"No se pudo cargar el template: {template_path}"
-    )
-
-
-# ==========================================
-# TAMAÑO DEL TEMPLATE
-# ==========================================
-
-h, w = template.shape[:2]
-
-print(f"Template: {w}x{h}")
-
-
-# ==========================================
-# TEMPLATE MATCHING
-# ==========================================
-
-resultado = cv2.matchTemplate(
-    imagen,
-    template,
-    cv2.TM_CCOEFF_NORMED
-)
-
-
-# ==========================================
-# OBTENER COORDENADAS
-# ==========================================
-
-ys, xs = (resultado >= UMBRAL).nonzero()
-
-print(f"Coincidencias encontradas: {len(xs)}")
+objects = [
+    MatchTemplate(personaje_path, imagen), 
+    MatchTemplate(diamond_path, imagen), 
+    MatchTemplate(door_key_path, imagen), 
+    MatchTemplate(hueco_path, imagen), 
+    MatchTemplate(key_path, imagen), 
+    MatchTemplate(pic_path, imagen), 
+    MatchTemplate(rock_in_path, imagen), 
+    MatchTemplate(rock_path, imagen), 
+    MatchTemplate(scape_block_path, imagen), 
+    MatchTemplate(space_enable_path, imagen),
+    MatchTemplate(no_picos_path, imagen)
+    ]
 
 
 # ==========================================
 # DIBUJAR RESULTADOS
 # ==========================================
 
-for x, y in zip(xs, ys):
+for obj in objects:
+    
+    xs, ys = obj.match_template(threshold=UMBRAL)
+    h, w = obj.get_template_size()
+    
+    r = int(random() * 255)
+    g = int(random() * 255)
+    b = int(random() * 255)
+    
+    for x, y in zip(xs, ys):
 
-    x = int(x)
-    y = int(y)
+        x = int(x)
+        y = int(y)
 
-    cv2.rectangle(
-        imagen,
-        (x, y),
-        (x + w, y + h),
-        (0, 255, 0),
-        2
-    )
+        cv2.rectangle(
+            imagen,
+            (x, y),
+            (x + w, y + h),
+            (r, g, b),
+            2
+        )
 
-    cv2.putText(
-        imagen,
-        f"({x}, {y})",
-        (x, y - 5),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (0, 255, 0),
-        1
-    )
+        cv2.putText(
+            imagen,
+            f"({x}, {y})",
+            (x, y - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (r, g, b),
+            1
+        )
 
-
-# ==========================================
-# GUARDAR RESULTADO
-# ==========================================
 
 resultado_path = BASE_DIR / "resultado.png"
 
