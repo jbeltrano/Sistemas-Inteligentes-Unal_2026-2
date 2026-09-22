@@ -1,12 +1,14 @@
 import cv2
 from pathlib import Path
 from random import random
+import numpy as np
 
 class MatchTemplate:
     
-    def __init__(self, template_path, imagen):
+    def __init__(self, template_path, imagen, reflejar=False):
         self.imagen = imagen
         self.template_path = template_path
+        self.reflejar = reflejar
         
         self.template_image = cv2.imread(str(self.template_path))
         self.check_images_exist(self.template_image, self.template_path)
@@ -34,6 +36,16 @@ class MatchTemplate:
             self.template_image,
             cv2.TM_CCOEFF_NORMED
         )
+        
+        # Si el objeto puede estar girado, probar también el template reflejado
+        # y quedarse con el mejor score de ambas orientaciones
+        if self.reflejar:
+            resultado_flip = cv2.matchTemplate(
+                self.imagen,
+                cv2.flip(self.template_image, 1),
+                cv2.TM_CCOEFF_NORMED
+            )
+            resultado = np.maximum(resultado, resultado_flip)
         
         ys, xs = (resultado >= threshold).nonzero()
         scores = resultado[ys, xs]
@@ -95,7 +107,7 @@ imagen = cv2.imread(str(imagen_path))
 MatchTemplate.check_images_exist(imagen, imagen_path)
 
 objects = [
-    MatchTemplate(personaje_path, imagen), 
+    MatchTemplate(personaje_path, imagen, reflejar=True), 
     MatchTemplate(diamond_path, imagen), 
     MatchTemplate(door_key_path, imagen), 
     MatchTemplate(hueco_path, imagen), 
