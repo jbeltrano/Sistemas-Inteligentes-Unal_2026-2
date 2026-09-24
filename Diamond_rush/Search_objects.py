@@ -84,6 +84,7 @@ class MatchTemplate:
 BASE_DIR = Path(__file__).resolve().parent
 
 imagen_path = BASE_DIR / "captura.png"
+# imagen_path = BASE_DIR / "levels" / "level19.png"
 template_path = BASE_DIR / "templates" / "personaje.png"
 personaje_path = BASE_DIR / "templates" / "personaje.png"
 diamond_path = BASE_DIR / "templates" / "diamond.png"
@@ -96,9 +97,13 @@ rock_path = BASE_DIR / "templates" / "rock.png"
 scape_block_path = BASE_DIR / "templates" / "scape_block.png"
 space_enable_path = BASE_DIR / "templates" / "scape_enable.png"
 no_picos_path = BASE_DIR / "templates" / "no_picos.png"
+button_path = BASE_DIR / "templates" / "button.png"
+lava_path = BASE_DIR / "templates" / "lava.png"
+reja_path = BASE_DIR / "templates" / "reja.png"
 
 UMBRAL = 0.80
-
+UMBRAL = 0.90
+# UMBRAL = 0.96
 # Fracción máxima del área del template que dos coincidencias pueden compartir
 # antes de considerarse la misma meseta (0 = nada, 1 = todo)
 SOLAPE_MAX = 0.4
@@ -117,14 +122,15 @@ objects = [
     MatchTemplate(rock_path, imagen), 
     MatchTemplate(scape_block_path, imagen), 
     MatchTemplate(space_enable_path, imagen),
-    MatchTemplate(no_picos_path, imagen)
+    MatchTemplate(no_picos_path, imagen),
+    MatchTemplate(button_path, imagen),
+    MatchTemplate(lava_path, imagen),
+    MatchTemplate(reja_path, imagen)
     ]
 
 
-# ==========================================
-# DIBUJAR RESULTADOS
-# ==========================================
-
+# Obteiene los resultados 
+data = []
 for obj in objects:
     
     xs, ys = obj.match_template(threshold=UMBRAL)
@@ -133,7 +139,11 @@ for obj in objects:
     r = int(random() * 255)
     g = int(random() * 255)
     b = int(random() * 255)
+    data.append((xs,ys,h,w,r,g,b))
     
+
+# Dibuja los resultados en la imagen
+for xs, ys, h, w, r, g, b in data:
     for x, y in zip(xs, ys):
 
         x = int(x)
