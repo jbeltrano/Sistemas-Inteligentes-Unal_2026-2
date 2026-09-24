@@ -2,6 +2,7 @@ import cv2
 from pathlib import Path
 from random import random
 import numpy as np
+from collections import deque
 
 class MatchTemplate:
     
@@ -76,7 +77,77 @@ class MatchTemplate:
         ancho = max(0, min(x + w, dx + w) - max(x, dx))
         alto  = max(0, min(y + h, dy + h) - max(y, dy))
         return (ancho * alto) / (w * h)
-    
+
+
+def detectar_caminos(imagen):
+    """
+    Detecta las zonas de suelo/camino del nivel.
+    Devuelve una máscara binaria:
+        blanco = camino
+        negro = obstáculo
+    """
+
+    hsv = cv2.cvtColor(imagen, cv2.COLOR_BGR2HSV)
+
+    # El suelo del juego es marrón oscuro.
+    #
+    # Estos valores son un punto de partida.
+    # Conviene ajustarlos viendo la máscara resultante.
+    lower = np.array([5, 40, 20])
+    upper = np.array([30, 220, 150])
+
+    mask = cv2.inRange(hsv, lower, upper)
+
+    # Limpiar pequeños agujeros/ruido
+    kernel = np.ones((5, 5), np.uint8)
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        kernel
+    )
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        kernel
+    )
+
+    return mask
+
+def crear_grid(mask, x0, y0, tile_w, tile_h, filas, columnas):
+    """
+    Convierte la máscara de caminos en una cuadrícula.
+
+    1 = transitable
+    0 = obstáculo
+    """
+
+    grid = np.zeros((filas, columnas), dtype=np.uint8)
+
+    for fila in range(filas):
+        for col in range(columnas):
+
+            x1 = x0 + col * tile_w
+            y1 = y0 + fila * tile_h
+
+            x2 = x1 + tile_w
+            y2 = y1 + tile_h
+
+            celda = mask[y1:y2, x1:x2]
+
+            if celda.size == 0:
+                continue
+
+            porcentaje_camino = np.mean(celda > 0)
+
+            # Si más de la mitad de la casilla
+            # corresponde al suelo, consideramos que se puede caminar.
+            if porcentaje_camino > 0.50:
+                grid[fila, col] = 1
+
+    return grid
+
 # ==========================================
 # CONFIGURACIÓN
 # ==========================================
@@ -140,7 +211,17 @@ for obj in objects:
     g = int(random() * 255)
     b = int(random() * 255)
     data.append((xs,ys,h,w,r,g,b))
-    
+
+caminos = detectar_caminos(imagen)
+
+
+
+
+cv2.imwrite(
+    str(BASE_DIR / "caminos.png"),
+    caminos
+)
+
 
 # Dibuja los resultados en la imagen
 for xs, ys, h, w, r, g, b in data:

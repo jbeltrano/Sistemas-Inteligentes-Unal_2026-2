@@ -1,8 +1,0 @@
-rock: 5 rock_in: 5
-  rock (np.int64(902), np.int64(684))  cercana: [(np.int64(900), np.int64(679))]
-  rock (np.int64(1141), np.int64(505))  cercana: [(np.int64(1138), np.int64(501))]
-  rock (np.int64(847), np.int64(811))  cercana: [(np.int64(844), np.int64(807))]
-  rock (np.int64(1026), np.int64(393))  cercana: [(np.int64(1024), np.int64(389))]
-  rock (np.int64(728), np.int64(512))  cercana: [(np.int64(725), np.int64(508))]
-hueco th 0.7 : 1 [(1022, 746)]
-hueco th 0.6 : 2 [(1022, 746), (1145, 412)]
