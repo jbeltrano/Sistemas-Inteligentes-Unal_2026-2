@@ -81,10 +81,16 @@ def draw_graph(frame: np.ndarray, state: GameState, output_path: Path) -> None:
             color = (0, 200, 0) if (i, j) in state.graph_nodes else (0, 0, 200)
             cv2.rectangle(background, (x, y), (x + tile, y + tile), color, 1)
 
-    for a, b in state.graph_edges:
-        cv2.line(
-            background, cell_center(a), cell_center(b), (0, 255, 255), 1, cv2.LINE_AA
-        )
+    for node, neighbors in state.adjacency.items():
+        for neighbor in neighbors:
+            cv2.line(
+                background,
+                cell_center(node),
+                cell_center(neighbor),
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
     for cell in state.graph_nodes:
         x = state.origin_x + cell[1] * tile
@@ -155,7 +161,8 @@ def _write_summary(state: GameState, write) -> None:
     write(f"Personaje en la celda {state.player_cell} de {state.grid.shape}")
     write(f"Casillas transitables: {int(state.grid.sum())}")
     write(f"Nodos del grafo: {len(state.graph_nodes)}")
-    write(f"Aristas del grafo: {len(state.graph_edges)}")
+    edge_count = sum(len(neighbors) for neighbors in state.adjacency.values()) // 2
+    write(f"Aristas del grafo: {edge_count}")
     write("Detecciones por tipo:")
     for name in config.TEMPLATE_NAMES:
         count = len(state.objects_named(name))

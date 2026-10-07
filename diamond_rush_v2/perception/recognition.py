@@ -20,11 +20,19 @@ from perception.state import DetectedObject, GameState
 class TemplateMatcher:
     """Busca un template dentro de un frame y devuelve sus coincidencias."""
 
-    def __init__(self, template_path: Path, frame: np.ndarray, flip: bool = False):
+    def __init__(self, template_path: Path, frame: np.ndarray, name: str = None, flip: bool = False):
+        """
+        `name` es el nombre lógico del objeto (ej. "player"), separado
+        del nombre del archivo. Por defecto es el nombre del archivo
+        (como antes), pero se puede pasar explícito para que varios
+        templates distintos (ej. "player.png" y "player_key.png")
+        cuenten como el mismo objeto a la hora de reportar detecciones
+        y de resolver superposiciones entre templates.
+        """
         self.frame = frame
         self.template_path = template_path
         self.flip = flip
-        self.name = Path(template_path).stem
+        self.name = name or Path(template_path).stem
 
         self.template_image = cv2.imread(str(self.template_path))
         self._check_image_exists(self.template_image, self.template_path)
@@ -132,114 +140,72 @@ def detect_paths(frame: np.ndarray) -> np.ndarray:
     return mask
 
 
+def board_geometry(frame: np.ndarray) -> Tuple[int, int, int]:
+    """
+    Geometría del tablero a partir del tamaño del frame: (tile,
+    origin_x, origin_y).
+
+    El tablero es de BOARD_ROWS x BOARD_COLS celdas cuadradas y ocupa
+    el canvas; el HUD solo se dibuja encima de las filas superiores.
+    Por eso el tamaño de celda sale de dividir el frame entre las
+    dimensiones conocidas del tablero, y la grilla se centra en el
+    sobrante (si lo hay).
+    """
+    height, width = frame.shape[:2]
+    tile = min(width // config.BOARD_COLS, height // config.BOARD_ROWS)
+
+    if not config.MIN_TILE <= tile <= config.MAX_TILE:
+        raise RuntimeError(
+            f"Tamaño de celda inesperado ({tile}px) para un frame de "
+            f"{width}x{height} y un tablero de "
+            f"{config.BOARD_ROWS}x{config.BOARD_COLS}"
+        )
+
+    origin_x = (width - tile * config.BOARD_COLS) // 2
+    origin_y = (height - tile * config.BOARD_ROWS) // 2
+    return tile, origin_x, origin_y
+
+
 def _path_fraction(mask: np.ndarray, x: int, y: int, tile: int) -> float:
     """
-    Proporción de suelo de una celda. Si se sale de la imagen devuelve
-    0.0 para que no cuente como transitable.
+    Proporción de suelo en la zona central de una celda (se ignora un
+    margen CELL_MARGIN por lado). Fuera de la imagen devuelve 0.0.
     """
     height, width = mask.shape[:2]
 
     if x < 0 or y < 0 or x + tile > width or y + tile > height:
         return 0.0
 
-    return float(np.mean(mask[y : y + tile, x : x + tile] > 0))
+    margin = int(tile * config.CELL_MARGIN)
+    inner = mask[y + margin : y + tile - margin, x + margin : x + tile - margin]
+    if inner.size == 0:
+        return 0.0
+
+    return float(np.mean(inner > 0))
 
 
-def _cell_origin(center: Tuple[int, int], tile: int) -> Tuple[int, int]:
+def create_grid(mask: np.ndarray, tile: int, origin_x: int, origin_y: int) -> np.ndarray:
     """
-    Esquina superior izquierda de la celda que contiene un punto. El
-    punto queda a media celda de esa esquina.
+    Grilla de BOARD_ROWS x BOARD_COLS (1 = suelo, 0 = obstáculo).
+
+    Una celda es suelo si su zona central supera MIN_PATH_FRACTION en
+    la máscara de caminos. Las celdas cuyo centro queda bajo el HUD
+    nunca son suelo: lo que se ve ahí es interfaz, no tablero.
     """
-    cx, cy = center
-    return (
-        int(round((cx - tile / 2) / tile)) * tile,
-        int(round((cy - tile / 2) / tile)) * tile,
-    )
+    grid = np.zeros((config.BOARD_ROWS, config.BOARD_COLS), dtype=np.uint8)
 
-
-def _tiles_around(center: Tuple[int, int], tile: int, reach: int, width: int, height: int):
-    """Celdas completas alrededor de un punto; descarta las que se salen de la imagen."""
-    x0, y0 = _cell_origin(center, tile)
-    cells = []
-
-    for i in range(-reach, reach + 1):
-        for j in range(-reach, reach + 1):
-            x = x0 + j * tile
-            y = y0 + i * tile
-
-            if x >= 0 and y >= 0 and x + tile <= width and y + tile <= height:
-                cells.append((x, y))
-
-    return cells
-
-
-def detect_tile_size(mask: np.ndarray, player_center: Tuple[int, int]) -> Tuple[int, float]:
-    """
-    Estima el paso de la retícula probando cada tamaño candidato y
-    puntuándolo por qué proporción de las celdas cercanas al personaje
-    queda en zona ambigua (ni suelo ni vacío). Un paso bien alineado
-    deja esa proporción cerca de cero.
-    """
-    height, width = mask.shape[:2]
-
-    best_tile = None
-    best_score = None
-
-    for tile in range(config.MIN_TILE, config.MAX_TILE + 1):
-        cells = _tiles_around(player_center, tile, config.ANALYSIS_RANGE, width, height)
-
-        if not cells:
-            continue
-
-        score = float(np.mean([
-            0.25 < _path_fraction(mask, x, y, tile) < 0.75
-            for x, y in cells
-        ]))
-
-        if best_score is None or score < best_score:
-            best_tile = tile
-            best_score = score
-
-    if best_tile is None:
-        return config.DEFAULT_TILE, 1.0
-
-    if best_score > config.AMBIGUITY_THRESHOLD:
-        best_tile = config.DEFAULT_TILE
-
-    return best_tile, best_score
-
-
-def create_grid(mask: np.ndarray, tile: int) -> Tuple[np.ndarray, int, int]:
-    """
-    Convierte la máscara de caminos en una grilla de celdas de lado
-    `tile`.
-
-    La grilla se ancla a la esquina superior izquierda de la propia
-    imagen (pixel (0, 0)), no a la posición del personaje: esto
-    funciona porque la captura ya viene recortada justo al borde del
-    tablero. Devuelve (grid, origin_x, origin_y) para mantener la
-    misma interfaz que el resto del código usa al convertir entre
-    celda y píxel; hoy origin_x y origin_y siempre son 0, pero quedan
-    explícitos por si en el futuro hace falta compensar un desfase
-    real entre la captura y el tablero (ver nota más abajo).
-    """
-    height, width = mask.shape[:2]
-    origin_x, origin_y = 0, 0
-
-    rows = int((height - origin_y) // tile)
-    cols = int((width - origin_x) // tile)
-
-    grid = np.zeros((rows, cols), dtype=np.uint8)
-
-    for i in range(rows):
-        for j in range(cols):
+    for i in range(config.BOARD_ROWS):
+        for j in range(config.BOARD_COLS):
             x = origin_x + j * tile
             y = origin_y + i * tile
+
+            if y + tile // 2 < config.HUD_HEIGHT:
+                continue
 
             if _path_fraction(mask, x, y, tile) > config.MIN_PATH_FRACTION:
                 grid[i, j] = 1
 
-    return grid, origin_x, origin_y
+    return grid
 
 
 def cell_at(point: Tuple[int, int], origin_x: int, origin_y: int, tile: int) -> Tuple[int, int]:
@@ -253,25 +219,15 @@ def neighbors(cell: Tuple[int, int]):
     return ((i - 1, j), (i + 1, j), (i, j - 1), (i, j + 1))
 
 
-def build_graph(grid: np.ndarray):
+def build_graph(grid: np.ndarray) -> Set[Tuple[int, int]]:
     """
-    Arma el grafo de las celdas transitables. Cada nodo es una celda
-    (i, j) de la grilla; las aristas solo unen vecinos de cuatro
-    direcciones, así que no se pueden cortar esquinas por el aire.
+    Nodos del grafo: cada celda transitable de la grilla. La lista de
+    adyacencia (quién es vecino de quién) se arma más adelante, en
+    recognize(), ya filtrada a lo alcanzable -- no tiene sentido
+    calcularla acá para después descartar la mitad.
     """
     rows, cols = grid.shape
-
-    nodes: Set[Tuple[int, int]] = {
-        (i, j) for i in range(rows) for j in range(cols) if grid[i, j]
-    }
-
-    edges: Set[Tuple[Tuple[int, int], Tuple[int, int]]] = set()
-    for node in nodes:
-        for neighbor in neighbors(node):
-            if neighbor in nodes:
-                edges.add(tuple(sorted((node, neighbor))))
-
-    return nodes, edges
+    return {(i, j) for i in range(rows) for j in range(cols) if grid[i, j]}
 
 
 def reachable_component(nodes: Set[Tuple[int, int]], origin: Tuple[int, int]):
@@ -295,14 +251,23 @@ def reachable_component(nodes: Set[Tuple[int, int]], origin: Tuple[int, int]):
 
 
 def _load_matchers(frame: np.ndarray) -> List[TemplateMatcher]:
-    return [
-        TemplateMatcher(
-            config.TEMPLATES_DIR / f"{name}.png",
-            frame,
-            flip=(name == config.PLAYER_NAME),
-        )
-        for name in config.TEMPLATE_NAMES
-    ]
+    matchers = []
+    for name in config.TEMPLATE_NAMES:
+        # La mayoría de los objetos tienen un solo archivo de template
+        # (el propio nombre). Algunos, como "player", tienen más de
+        # uno porque el objeto cambia de aspecto según el estado del
+        # juego (con una llave en la mano, por ejemplo) -- ver
+        # config.TEMPLATE_VARIANTS.
+        for variant in config.TEMPLATE_VARIANTS.get(name, [name]):
+            matchers.append(
+                TemplateMatcher(
+                    config.TEMPLATES_DIR / f"{variant}.png",
+                    frame,
+                    name=name,
+                    flip=(name == config.PLAYER_NAME),
+                )
+            )
+    return matchers
 
 
 def recognize(frame: np.ndarray) -> GameState:
@@ -316,10 +281,33 @@ def recognize(frame: np.ndarray) -> GameState:
     candidates: List[Tuple[str, int, int, int, int, float]] = []
     for matcher in matchers:
         height, width = matcher.template_size
-        for x, y, score in matcher.match(threshold=config.THRESHOLD, max_overlap=config.MAX_OVERLAP):
+        # El personaje cambia de pose mientras se desliza entre
+        # celdas (la animación de caminar), así que su parecido con el
+        # template estático baja más que el de objetos quietos. Se le
+        # da un umbral más permisivo solo a él.
+        threshold = config.PLAYER_THRESHOLD if matcher.name == config.PLAYER_NAME else config.THRESHOLD
+        for x, y, score in matcher.match(threshold=threshold, max_overlap=config.MAX_OVERLAP):
             candidates.append((matcher.name, x, y, width, height, score))
 
-    detections = _resolve_overlaps(candidates, config.MAX_OVERLAP)
+    # El personaje es el único objeto obligatorio: no puede perder su
+    # lugar frente a otro template que matchee mejor en el mismo sitio
+    # (por ejemplo, el ítem que lleva en la mano puede parecerse al de
+    # un objeto suelto). Por eso se resuelve aparte y primero, en su
+    # propia competencia -- solo contra sus propias variantes
+    # (player.png, player_key.png, ...) -- en vez de competir a la par
+    # de todo lo demás.
+    player_candidates = [c for c in candidates if c[0] == config.PLAYER_NAME]
+    other_candidates = [c for c in candidates if c[0] != config.PLAYER_NAME]
+
+    player_matches = _resolve_overlaps(player_candidates, config.MAX_OVERLAP)
+    if not player_matches:
+        raise RuntimeError("No se encontró el personaje en el frame")
+
+    player_box = player_matches[0]
+    player_center = player_box.center
+
+    other_detections = _resolve_overlaps(other_candidates, config.MAX_OVERLAP)
+    detections = [player_box] + other_detections
 
     # El contador de diamantes del HUD, arriba del tablero, matchea el
     # template de "diamond" igual que uno real. No es parte del
@@ -327,36 +315,52 @@ def recognize(frame: np.ndarray) -> GameState:
     # esa franja.
     detections = [obj for obj in detections if obj.center[1] >= config.HUD_HEIGHT]
 
-    player_matches = [obj for obj in detections if obj.name == config.PLAYER_NAME]
-    if not player_matches:
-        raise RuntimeError("No se encontró el personaje en el frame")
-
-    # _resolve_overlaps ordena por score, así que el primero es la
-    # mejor coincidencia del personaje.
-    player_center = player_matches[0].center
-
+    tile_size, origin_x, origin_y = board_geometry(frame)
     path_mask = detect_paths(frame)
-    tile_size, _ = detect_tile_size(path_mask, player_center)
-    grid, origin_x, origin_y = create_grid(path_mask, tile_size)
+    grid = create_grid(path_mask, tile_size, origin_x, origin_y)
+    rows, cols = grid.shape
+
+    def in_board(cell):
+        return 0 <= cell[0] < rows and 0 <= cell[1] < cols
+
+    # Una detección fuera del tablero no puede ser un objeto del juego.
+    detections = [
+        obj for obj in detections
+        if in_board(cell_at(obj.center, origin_x, origin_y, tile_size))
+    ]
+
+    # Todo objeto está parado sobre una celda del tablero, así que su
+    # celda es parte del suelo aunque el sprite tape el color y la
+    # máscara no la vea. Qué objetos bloquean el paso (roca, hoyo,
+    # lava, puertas...) NO se decide acá: eso cambia durante el juego
+    # y lo resuelve el planificador con objects_by_cell.
+    for obj in detections:
+        grid[cell_at(obj.center, origin_x, origin_y, tile_size)] = 1
 
     player_cell = cell_at(player_center, origin_x, origin_y, tile_size)
+    if not in_board(player_cell):
+        raise RuntimeError(f"El personaje quedó fuera del tablero: {player_cell}")
+    grid[player_cell] = 1
 
-    rows, cols = grid.shape
-    if 0 <= player_cell[0] < rows and 0 <= player_cell[1] < cols:
-        # El sprite tapa su propia celda, así que nunca pasa el filtro
-        # de suelo por sí sola.
-        grid[player_cell] = 1
-
-    nodes, edges = build_graph(grid)
+    nodes = build_graph(grid)
     reachable = reachable_component(nodes, player_cell)
-    edges = {edge for edge in edges if edge[0] in reachable and edge[1] in reachable}
+
+    adjacency: Dict[Tuple[int, int], List[Tuple[int, int]]] = {
+        node: [n for n in neighbors(node) if n in reachable] for node in reachable
+    }
+
+    objects_by_cell: Dict[Tuple[int, int], List[DetectedObject]] = {}
+    for obj in detections:
+        cell = cell_at(obj.center, origin_x, origin_y, tile_size)
+        objects_by_cell.setdefault(cell, []).append(obj)
 
     return GameState(
         grid=grid,
         graph_nodes=reachable,
-        graph_edges=edges,
+        adjacency=adjacency,
         player_cell=player_cell,
         objects=detections,
+        objects_by_cell=objects_by_cell,
         origin_x=origin_x,
         origin_y=origin_y,
         tile_size=tile_size,
