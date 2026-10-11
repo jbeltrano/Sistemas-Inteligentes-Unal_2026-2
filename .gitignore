@@ -1,0 +1,15 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Caché de Python
+__pycache__/
+*.py[cod]
+
+# Artefactos generados de Diamond_rush
+Diamond_rush/resultado.png
+Diamond_rush/caminos.png
+Diamond_rush/debug*.png
+Diamond_rush/.pytest_cache/
+Diamond_rush/.coverage
