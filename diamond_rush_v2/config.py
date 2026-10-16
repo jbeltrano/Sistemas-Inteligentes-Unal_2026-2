@@ -54,3 +54,20 @@ GAME_URL = "https://www.minijuegos.com/embed/diamond-rush"
 IFRAME_ID = "game-player"
 DEBUGGER_ADDRESS = "127.0.0.1:9222"
 WINDOW_SIZE = "900,1050"
+
+# ---------------------------------------------------------------
+# Planificación (búsqueda en el espacio de mundos)
+# ---------------------------------------------------------------
+MAX_NODES_ASTAR = 150_000      # presupuesto de nodos para A*
+MAX_NODES_BACKTRACK = 80_000   # presupuesto de nodos para el retroceso (DFS)
+MAX_DEPTH = 600                # tope de profundidad del retroceso
+
+# ---------------------------------------------------------------
+# Control (teclado vía Selenium)
+# ---------------------------------------------------------------
+# El juego se maneja con las flechas. Cada dirección del plan es una
+# flecha que se manda al canvas por Selenium (no hay scraping: solo
+# pulsaciones).
+STEP_SECONDS = 0.40            # pausa entre pasos del plan (en segundos)
+PRESS_SECONDS = 0.08           # cuánto se mantiene la flecha presionada
+VERIFY_EACH_STEP = False       # re-percibir tras cada paso (si hay capturador)

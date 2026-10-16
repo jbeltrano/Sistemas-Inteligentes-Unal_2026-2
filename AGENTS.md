@@ -1,36 +1,64 @@
 # AGENTS.md
 
-Repositorio del curso (Sistemas Inteligentes, UNAL 2026-2). Contiene proyectos independientes, una carpeta por proyecto. No hay tooling compartido: ni build/test, ni linter, ni framework de tests, ni CI, ni `.gitignore`, ni `requirements`.
+Repositorio del curso Sistemas Inteligentes (UNAL 2026-2). Proyectos independientes, una carpeta por proyecto. Sin tooling compartido: no hay CI, ni linter, ni `requirements` raíz, ni `pytest.ini`/`setup.cfg`.
+
+**Idioma:** READMEs, comentarios, docstrings, prints y mensajes de commit van en español (aunque algunos nombres de módulos en `diamond_rush_v2/` estén en inglés).
+
+## Estado del working tree (revisar `git status` antes de commitear)
+
+- `AGENTS.md` y `Picas_y_Fijas/` aparecen **borrados** en el working tree (siguen en `HEAD`): no los restaures ni los commitees sin preguntar.
+- `Diamond_rush/*.py`, `Diamond_rush/percepcion/`, `Diamond_rush/tests/` están **sin trackear**. El working tree suele estar sucio; no commitear salvo que se pida.
 
 ## Proyectos
 
-- `Picas_y_Fijas/` — Proyecto 1 (agente para juego mastermind-style). Efectivamente terminado: `picas_fijas.py` (solver tipo brute-force/información, único que usa numpy), `picas_fijas2.py` (minimax/Knuth, solo stdlib) y `picas_fijas3.py` (árbol de decisión precomputado, solo stdlib).
-- `Diamond_rush/` — Proyecto 2 (activo). Meta (README.md): un agente que juegue los 20 niveles de "Diamond Rush" en https://www.minijuegos.com/juego/diamond-rush. Etapa actual: *solo detección de objetos y camino*; aún NO es agente jugador (sin captura de pantalla en vivo ni control de entrada).
+### `Diamond_rush/` — agente v1 (el más completo/activo)
 
-## Comandos
-
-Correr los scripts desde dentro de su propia carpeta:
+Agente deliberativo basado en modelos (sin aprendizaje) para el juego "Diamond Rush". Cierra el lazo percepción → decisión → control → verificación. Lógica y contrato de estado en español (`percepcion/estado.py`, `percepcion/reconocimiento.py`, `planificacion.py`, `control.py`, `agente.py`). `Search_objects.py` es el script monolítico original: legado, no lo uses como fuente de verdad.
 
 ```
-# Picas_y_Fijas
-python picas_fijas.py     # picas_fijas2.py / picas_fijas3.py equivalentes
-
-# Diamond_rush (requiere opencv-python)
-python Search_objects.py  # lee captura.png, dibuja coincidencias, escribe resultado.png y caminos.png
+# desde dentro de Diamond_rush/
+python main.py                         # plan sobre captura.png (por defecto)
+python main.py --imagen levels/level1.png
+python main.py --capturar              # 1 screenshot de pantalla (mss)
+python main.py --enviar                # además suelta el plan por teclado
+python main.py --auto                  # = --capturar --enviar
 ```
 
-## Convenciones y gotchas (Diamond_rush)
+- Deps en `Diamond_rush/requirements.txt` (numpy, opencv-python, mss, pynput, pytest); instalar dentro de un venv.
+- El plan se calcula con **UNA sola captura**; `--enviar` recién ahí manda teclas. `--capturar` usa `mss` sobre la pantalla, no el canvas vía DOM.
+- Backend de teclado: `pynput` o `xdotool` (autodetectado en `control.py`). Sin ninguno de los dos, `Teclado()` lanza `RuntimeError`.
 
-- `Search_objects.py` usa `cv2.matchTemplate` (TM_CCOEFF_NORMED) sobre 14 tipos de objeto. El personaje usa `reflejar=True` (prueba también el template espejado horizontal). NMS greed y con `SOLAPE_MAX` (fracción del área del template) para una sola caja por objeto.
-- El umbral está seteado dos veces en el bloque CONFIGURACIÓN (`UMBRAL = 0.80` seguido de `UMBRAL = 0.90`): manda el último. `SOLAPE_MAX = 0.4` es la fracción máxima del área del template compartida entre dos coincidencias antes de considerarlas la misma meseta.
-- Además de objetos, detecta el suelo/camino por color HSV (`detectar_caminos`, escribe `caminos.png`) y expone `crear_grid()` que convierte la máscara a una grilla transitable (casilla = camino si >50% de píxeles >0). Los rangos HSV del suelo son explícitamente "un punto de partida" a calibrar viendo la máscara resultante.
-- El input por defecto es `captura.png`. Para probar un nivel concreto hay capturas estáticas en `levels/level1..20.png`; se cambia descomentando la línea `imagen_path = BASE_DIR / "levels" / "level19.png"` en el bloque CONFIGURACIÓN.
-- Los templates de `templates/` son screenshots recortados a mano de un nivel/frame específico: si el juego se ve distinto, dejan de matchear. No hay 1:1 entre los templates y el código: `totem.png` no se usa en la lista de objetos y la variable `space_enable_path` apunta a `scape_enable.png`.
-- Regla anti-scraping: el agente solo lee píxeles del juego (imágenes/pantalla); nunca HTTP/DOM/JS del sitio.
+### `diamond_rush_v2/` — refactor (parcial)
 
-## Artefactos y estado del repo
+Reorganización modular del v1: `perception/` (implementado), `computation/` y `play/` son **stubs vacíos** (`compute.py` y `control.py` con 0 líneas). Solo existe la percepción + un agente de una sola pasada que imprime el `GameState`.
 
-- `picas_fijas3.py` cachea su árbol a `arbol_picas_fijas.json` en el cwd (artefacto generado, no commitear). En Diamond_rush los outputs generados son `resultado.png` y `caminos.png` (commiteados hoy mismo; van y vienen con cada experimento), y `captura.png` es el sample de entrada.
-- Dependencias actuales: `numpy` (solo `picas_fijas.py`) y `opencv-python` (Diamond_rush).
-- Git: `main` está al día con `origin/main`; hay una rama `origin/nuevo_picas_fijas` (intento alterno de picas y fijas). El working tree suele tener cambios sin commitear en `Diamond_rush/` — revisa `git status` antes de commitear.
-- Todo texto legible por humanos va en español: READMEs, comentarios, prints de consola y mensajes de commit.
+```
+# desde dentro de diamond_rush_v2/
+python main.py        # run_agent(); requiere Chrome con remote debugging (ver abajo)
+```
+
+- **Contrato de percepción:** `perception/state.py` define `GameState`, el único contrato entre percepción y el resto. Regla: `computation/` y `play/` importan **solo** de `perception.state`, nunca de `cv2` ni de `recognition.py`. Detalle completo en `diamond_rush_v2/perception/README.md` (leerlo antes de tocar percepción).
+- Captura con **Selenium** sobre un Chrome ya abierto: `capture.attach_driver()` se conecta por CDP a `127.0.0.1:9222` sin navegar. **No llamar `driver.quit()`** sobre ese driver: cierra el navegador abierto a mano con el progreso del profesor.
+- Lanzar el Chrome con debugging (comando en `Nuevo Documento de texto.txt`):
+  `chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\Users\juanp\chrome-agente"`. Hay que pasar el tutorial a mano y dejar el nivel en pantalla.
+- **No hay `requirements.txt`** para v2; necesita `selenium` (además de opencv/numpy), que no está listado en ningún lado.
+- `main.py` tiene comentadas las llamadas a depuración; para revisar reconocimiento sobre imágenes estáticas usa `debug.test_recognition(path)` / `debug.test_recognition_all_levels()` (descomentar en `main.py`). `debug.py` no se usa desde `agent.py`.
+
+## Hechos compartidos
+
+- **Geometría del tablero:** siempre 15 filas × 10 columnas. `tile_size` se deriva del frame (`min(ancho//10, alto//15)`), no se estima. El HUD se dibuja **encima** del tablero (no lo desplaza); las celdas bajo `HUD_HEIGHT` valen 0. Cuidado con el orden: celdas `(fila, col)`, píxeles `(x, y)`.
+- **Templates:** `templates/`/`assets/templates/` son recortes a mano de un frame concreto; si el juego se ve distinto dejan de matchear y hay que recalibrar `THRESHOLD`/`MIN_PATH_FRACTION` por nivel. Primera cosa a revisar ante suelo/objetos mal detectados: la máscara de caminos (HSV).
+- **Sin scraping:** el estado del juego se lee solo de píxeles (templates/máscara). No leer datos del juego por HTTP/DOM/JS. En v2 Selenium se usa únicamente para encuadrar el canvas, no para extraer datos.
+
+## Tests
+
+Solo `Diamond_rush/` tiene tests (pytest). Correr **desde dentro de `Diamond_rush/`** (no desde la raíz; `tests/conftest.py` mete `Diamond_rush` en `sys.path`):
+
+```
+# desde Diamond_rush/
+pytest                                   # toda la suite
+pytest tests/test_planificacion.py       # un módulo
+pytest tests/test_reconocimiento.py::test_reconocer_captura_real  # un test
+```
+
+Los tests end-to-end dependen de OpenCV + numpy + los templates reales y de `captura.png`; no son puros de lógica.
