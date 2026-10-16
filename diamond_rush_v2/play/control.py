@@ -52,11 +52,23 @@ class Keyboard:
         self.canvas.click()
 
     def press(self, direction: str) -> None:
-        """Pulsacion de la flecha correspondiente a `direction`."""
+        """
+        Pulsación de la flecha correspondiente a `direction`.
+
+        Se manda como UNA sola cadena: key_down -> pausa -> key_up. La pausa
+        es necesaria porque el juego necesita ver la tecla presionada durante
+        al menos un frame para registrar el movimiento (una pulsación de
+        duración cero no lo mueve). Antes se usaban dos perform() separados
+        -- key_down y key_up -- y como key_down/key_up con elemento anteponen
+        un click() y un movimiento de puntero, la tecla quedaba presionada de
+        más y el personaje avanzaba dos casillas.
+        """
         key = KEYS[direction]
-        ActionChains(self.driver).key_down(key, self.canvas).perform()
-        time.sleep(self.press_seconds)
-        ActionChains(self.driver).key_up(key, self.canvas).perform()
+        actions = ActionChains(self.driver)
+        actions.key_down(key)
+        actions.pause(self.press_seconds)
+        actions.key_up(key)
+        actions.perform()
 
     def move(self, direction: str, pause: Optional[float] = None) -> None:
         """Presiona la flecha y espera el tiempo del paso."""

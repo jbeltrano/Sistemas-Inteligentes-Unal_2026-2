@@ -58,9 +58,15 @@ WINDOW_SIZE = "900,1050"
 # ---------------------------------------------------------------
 # Planificación (búsqueda en el espacio de mundos)
 # ---------------------------------------------------------------
-MAX_NODES_ASTAR = 150_000      # presupuesto de nodos para A*
-MAX_NODES_BACKTRACK = 80_000   # presupuesto de nodos para el retroceso (DFS)
-MAX_DEPTH = 600                # tope de profundidad del retroceso
+MAX_NODES_ASTAR = 400_000      # presupuesto de nodos para A*
+MAX_NODES_BACKTRACK = 120_000  # presupuesto de nodos para el retroceso (DFS)
+MAX_DEPTH = 900                # tope de profundidad del retroceso
+# A* ponderado: f = g + WEIGHT * h. Con WEIGHT>1 el sesgo hacia la meta
+# es mas fuerte (encuentra plan antes, a cambio de no ser optimo). Ayuda
+# en los puzzles tipo Sokoban de los niveles finales.
+A_STAR_WEIGHT = 2.0
+# Presupuesto de A* para subobjetivos de relleno de hoyo (locales).
+MAX_NODES_HOLE = 60_000
 
 # ---------------------------------------------------------------
 # Control (teclado vía Selenium)
@@ -69,5 +75,11 @@ MAX_DEPTH = 600                # tope de profundidad del retroceso
 # flecha que se manda al canvas por Selenium (no hay scraping: solo
 # pulsaciones).
 STEP_SECONDS = 0.40            # pausa entre pasos del plan (en segundos)
-PRESS_SECONDS = 0.08           # cuánto se mantiene la flecha presionada
-VERIFY_EACH_STEP = False       # re-percibir tras cada paso (si hay capturador)
+PRESS_SECONDS = 0.08           # cuánto se mantiene la flecha presionada (el juego exige un mínimo)
+VERIFY_EACH_STEP = True        # re-percibir tras cada paso y re-planificar si hay desvío
+MAX_REPLANS = 50               # tope de re-planificaciones seguidas antes de abortar
+# Asentado tras cada paso: se re-percibe hasta que la celda del personaje
+# deje de cambiar, para no leer un frame a mitad de la animación y creer
+# que hubo desvío (lo que reenviaría la misma flecha = doble movimiento).
+SETTLE_TIMEOUT = 1.0           # tiempo máximo de espera del asentado (segundos)
+SETTLE_POLL = 0.05             # pausa entre lecturas del asentado (segundos)

@@ -33,9 +33,20 @@ Este modulo importa SOLO de perception.state (el contrato) y config;
 nunca de cv2 ni de recognition.py.
 """
 import heapq
+import itertools
 from collections import deque
 from dataclasses import dataclass, field, replace
-from typing import Dict, FrozenSet, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import (
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import config
 from perception.state import GameState
@@ -66,12 +77,24 @@ class Action:
 @dataclass(frozen=True)
 class World:
     """
-    Modelo estatico del nivel para la busqueda.
+    Modelo del nivel para la busqueda (estatico + estado dinamico).
 
-    Todo son conjuntos de celdas (fila, columna). `walls` son celdas
-    intransitables (pared, hoyo, picos: los peligros del juego se
-    modelan como obstaculos); `rocks` son celdas ocupadas por una roca
-    empujable; `diamonds` son los diamantes por recolectar.
+    Todo son conjuntos de celdas (fila, columna):
+
+    - `walls`: celdas fijas intransitables (pared, picos activos).
+    - `rocks`: celdas ocupadas por una roca empujable.
+    - `diamonds`: diamantes por recolectar.
+    - `holes`: hoyos abiertos (bloquean salvo que se empuje una roca
+      dentro; al rellenarse el hoyo pasa a piso transitable).
+    - `gates`: rejas cerradas (bloquean hasta que se pisa un boton).
+    - `buttons`: botones (piso; placas de presion que abren una reja).
+    - `pressed`: botones ya activados (por el personaje o por una roca).
+    - `doors`: puertas con cerradura (bloquean hasta tener una llave).
+    - `keys`: llaves sueltas por recoger.
+    - `has_key`: el personaje ya tiene alguna llave (habilita `doors`).
+    - `exit`: celda de la salida (escape/totem); bloquea hasta que no
+      queden diamantes (`exit_unlocked`).
+    - `exit_unlocked`: la salida ya es transitable (0 diamantes).
 
     `nodes` y `adjacency` son el grafo de piso que aporta la percepcion
     (GameState): la topologia "pelada" (ignora objetos) de celdas de
@@ -88,9 +111,20 @@ class World:
     walls: FrozenSet[Cell] = frozenset()
     rocks: FrozenSet[Cell] = frozenset()
     diamonds: FrozenSet[Cell] = frozenset()
-    key: Optional[Cell] = None
+    holes: FrozenSet[Cell] = frozenset()
+    gates: FrozenSet[Cell] = frozenset()
+    buttons: FrozenSet[Cell] = frozenset()
+    # Botones ya activados (por el personaje o por una roca encima). Es
+    # monotono: una reja abierta no se vuelve a cerrar.
+    pressed: FrozenSet[Cell] = frozenset()
+    # Emparejamiento boton -> reja que abre (la percepcion no lo dice; se
+    # infiere por cercania global, 1:1).
+    button_gate: Dict[Cell, Cell] = field(default_factory=dict)
+    doors: FrozenSet[Cell] = frozenset()
+    keys: FrozenSet[Cell] = frozenset()
     has_key: bool = False
     exit: Optional[Cell] = None
+    exit_unlocked: bool = False
     nodes: FrozenSet[Cell] = frozenset()
     adjacency: Dict[Cell, List[Cell]] = field(default_factory=dict)
 
@@ -117,67 +151,86 @@ class Plan:
 # Semantica de los objetos detectados -> rol en el mundo
 # ---------------------------------------------------------------
 # Mapeo nombre logico del objeto de v2 (perception.state) -> categoria.
-# `closed_gate` bloquea; `open_gate`/`scape_*`/`door_key` son la salida.
+# El rol decide a que capa del World se agrega la celda (ver _ROLE_TO_WORLD).
 ROLES = {
     "diamond": "goal",
     "key": "key",
-    "door_key": "exit",
+    "door_key": "door",
     "scape_block": "exit",
     "scape_enable": "exit",
-    "open_gate": "exit",
+    "totem": "exit",
+    "open_gate": "floor",
     "rock": "rock",
-    "rock_in_hole": "fixed",
-    "closed_gate": "fixed",
-    "hole": "hazard",
+    "rock_in_hole": "floor",
+    "closed_gate": "gate",
+    "hole": "hole",
     "spike": "hazard",
-    "totem": "hazard",
     "no_spike": "floor",
-    "button": "floor",
+    "button": "button",
     "player": "player",
 }
+# Rol -> capas del World a las que aporta la celda. Los roles "special"
+# (key/exit) se manejan aparte por ser singulares / con estado.
 _ROLE_TO_WORLD = {
     "goal": ("diamonds",),
-    "key": ("key",),
-    "exit": ("exit",),
     "rock": ("rocks",),
     "fixed": ("walls",),
     "hazard": ("walls",),
+    "hole": ("holes",),
+    "gate": ("gates",),
+    "button": ("buttons",),
+    "door": ("doors",),
 }
 
 
 def world_from_state(state: GameState, roles: Optional[Dict[str, str]] = None) -> World:
     """
     Traduce el GameState percibido (grid + detecciones) al World de
-    busqueda. Los peligros del juego (hoyo, picos...) se tratan como
-    muros por defecto: el agente no entra a casillas letales.
+    busqueda. Los peligros estaticos (picos) se tratan como muros; los
+    estados dinamicos (hoyos, rejas, puertas, salida) se guardan como
+    capas propias para que el planificador los simule.
     """
     roles = roles or ROLES
     grid = state.grid.tolist()
     rows, cols = len(grid), (len(grid[0]) if grid else 0)
 
     walls = {(i, j) for i in range(rows) for j in range(cols) if not grid[i][j]}
+    # Una celda que el grafo de piso de la percepcion considera transitable
+    # NO es muro, aunque el grid la marque como no-camino (las rejas,
+    # puertas o la salida se dibujan como tile aparte y pueden caer fuera
+    # de la mascara de caminos). Sin esto, una reja quedaria atrapada en
+    # `walls` y no se podria pisar ni al abrirla.
+    if state.graph_nodes:
+        walls -= set(state.graph_nodes)
     rocks: Set[Cell] = set()
     diamonds: Set[Cell] = set()
-    key = None
+    holes: Set[Cell] = set()
+    gates: Set[Cell] = set()
+    buttons: Set[Cell] = set()
+    doors: Set[Cell] = set()
+    keys: Set[Cell] = set()
     exit_cell = None
 
     # Cada deteccion agrega su rol al mundo (una celda puede tener
     # varios objetos: el primero manda sobre la transitabilidad).
     for obj in state.objects:
         role = roles.get(obj.name, "floor")
+        cell = state.cell_of(obj.center)
         if role in _ROLE_TO_WORLD:
-            cell = state.cell_of(obj.center)
-            targets = _ROLE_TO_WORLD[role]
-            if "walls" in targets:
-                walls.add(cell)
-            if "rocks" in targets:
-                rocks.add(cell)
-            if "diamonds" in targets:
-                diamonds.add(cell)
-            if role == "key":
-                key = cell
-            if role == "exit":
-                exit_cell = cell
+            for target in _ROLE_TO_WORLD[role]:
+                {
+                    "walls": walls,
+                    "rocks": rocks,
+                    "diamonds": diamonds,
+                    "holes": holes,
+                    "gates": gates,
+                    "buttons": buttons,
+                    "doors": doors,
+                }[target].add(cell)
+        elif role == "key":
+            keys.add(cell)
+        elif role == "exit":
+            exit_cell = cell
 
     return World(
         rows=rows,
@@ -186,12 +239,55 @@ def world_from_state(state: GameState, roles: Optional[Dict[str, str]] = None) -
         rocks=frozenset(rocks),
         player=state.player_cell,
         diamonds=frozenset(diamonds),
-        key=key,
+        holes=frozenset(holes),
+        gates=frozenset(gates),
+        buttons=frozenset(buttons),
+        button_gate=_match_buttons_to_gates(buttons, gates),
+        doors=frozenset(doors),
+        keys=frozenset(keys),
         has_key=False,
         exit=exit_cell,
+        exit_unlocked=False,
         nodes=frozenset(state.graph_nodes),
         adjacency=state.adjacency,
     )
+
+
+def _match_buttons_to_gates(
+    buttons: Iterable[Cell], gates: Iterable[Cell]
+) -> Dict[Cell, Cell]:
+    """
+    Empareja botones con rejas 1:1 minimizando la distancia Manhattan
+    total (la percepcion no indica que reja abre cada boton). Es una
+    conjetura: el lazo cerrado la corrige si el juego abre otra reja.
+    """
+    bs = sorted(buttons)
+    gs = sorted(gates)
+    if not bs or not gs:
+        return {}
+    distance = lambda a, b: abs(a[0] - b[0]) + abs(a[1] - b[1])
+    if len(gs) <= 6:
+        best = None
+        best_cost = None
+        for perm in itertools.permutations(gs, min(len(bs), len(gs))):
+            cost = sum(distance(b, g) for b, g in zip(bs, perm))
+            if best_cost is None or cost < best_cost:
+                best_cost = cost
+                best = perm
+        return dict(zip(bs, best))
+    pairs = sorted(
+        (distance(b, g), b, g) for b in bs for g in gs
+    )
+    used_b: Set[Cell] = set()
+    used_g: Set[Cell] = set()
+    mapping: Dict[Cell, Cell] = {}
+    for _d, b, g in pairs:
+        if b in used_b or g in used_g:
+            continue
+        used_b.add(b)
+        used_g.add(g)
+        mapping[b] = g
+    return mapping
 
 
 # ---------------------------------------------------------------
@@ -216,11 +312,31 @@ def _grid_neighbors(world: World, cell: Cell) -> Iterable[Cell]:
             yield neighbor
 
 
+def _blocked(world: World, cell: Cell) -> bool:
+    """
+    La celda bloquea el paso por su estado dinamico actual (aunque sea
+    piso en la topologia): hoyo abierto, reja cerrada, puerta sin llave,
+    o salida aun bloqueada. No incluye rocas (se empujan aparte) ni los
+    muros fijos (esos estan en `walls`).
+    """
+    if cell in world.holes:
+        return True
+    if cell in world.gates:
+        return True
+    if cell in world.doors and not world.has_key:
+        return True
+    if cell == world.exit and not world.exit_unlocked:
+        return True
+    return False
+
+
 def _is_floor(world: World, cell: Cell) -> bool:
     """La celda existe como piso transitable (no es muro ni esta fuera)."""
-    if cell in world.walls or not world.in_bounds(cell):
+    if not world.in_bounds(cell) or cell in world.walls:
         return False
     if world.nodes and cell not in world.nodes:
+        return False
+    if _blocked(world, cell):
         return False
     return True
 
@@ -251,42 +367,101 @@ def _step(world: World, direction: str) -> Optional[Tuple[Action, World]]:
         return None
 
     if target in world.rocks:
-        # Empujar la roca a la celda de mas alla.
+        # Empujar la roca a la celda de mas alla. Dos jugadas especiales:
+        #  - hacia un hoyo: lo rellena (la roca queda fija);
+        #  - hacia un diamante: lo recolecta (la roca ocupa su celda).
         push = (target[0] + d[0], target[1] + d[1])
+        filling = push in world.holes
+        collecting = push in world.diamonds
+        if not _connected(world, target, push):
+            return None
+        if not filling and not _is_floor(world, push):
+            return None
+        # No empujar una roca sobre otras rocas, llaves, rejas, puertas ni
+        # la salida (sobre botones si: a veces es la unica salida, nivel 14).
         if (
-            not _connected(world, target, push)
-            or not _is_floor(world, push)
-            or push in world.rocks
-            # No empujar una roca sobre recolectables ni sobre la salida.
-            or push in world.diamonds
-            or push == world.key
+            push in world.rocks
+            or push in world.keys
+            or push in world.gates
+            or push in world.doors
             or push == world.exit
         ):
             return None
-        rocks = frozenset((world.rocks - {target}) | {push})
-        player = target
-        kind = "push"
+        holes = world.holes
+        diamonds = world.diamonds
+        if filling:
+            holes = frozenset(world.holes - {push})
+            rocks = frozenset(world.rocks - {target})
+        else:
+            rocks = frozenset((world.rocks - {target}) | {push})
+            if collecting:
+                diamonds = frozenset(world.diamonds - {push})
+        return Action("push", direction), replace(
+            world, rocks=rocks, holes=holes, diamonds=diamonds, player=target
+        )
     else:
-        rocks = world.rocks
-        player = target
-        kind = "move"
+        return Action("move", direction), replace(world, player=target)
 
-    new = replace(world, rocks=rocks, player=player)
-    return Action(kind, direction), new
+
+def _open_nearest_gate(world: World, button: Cell) -> FrozenSet[Cell]:
+    """
+    Activar un boton abre su reja emparejada (si sigue cerrada); si no
+    hay emparejamiento (fixtures sin `button_gate`), la reja mas cercana.
+    Al pisar todos los botones alcanzables se abren todas las rejas; el
+    lazo cerrado corrige si el juego abrio otra.
+    """
+    if not world.gates:
+        return world.gates
+    gate = world.button_gate.get(button)
+    if gate is None or gate not in world.gates:
+        gate = min(
+            world.gates,
+            key=lambda g: (abs(g[0] - button[0]) + abs(g[1] - button[1]), g),
+        )
+    return frozenset(world.gates - {gate})
 
 
 def _collect(world: World) -> World:
-    """Ultima transicion: si el personaje piso un diamante o la llave."""
-    diamonds = world.diamonds - {world.player}
-    key = world.key
-    has_key = world.has_key
-    if world.player == world.key:
-        key = None
-        has_key = True
-    if diamonds == world.diamonds and key == world.key:
+    """
+    Ultima transicion tras pisar una celda: recoge diamantes/llaves,
+    activa botones (por el personaje o por una roca encima) y desbloquea
+    la salida al no quedar diamantes.
+    """
+    player = world.player
+    diamonds = world.diamonds - {player}
+    keys = world.keys - {player}
+    has_key = world.has_key or player in world.keys
+    # Un boton es una placa de presion: se activa si lo pisa el personaje
+    # o si queda una roca encima. Cada boton recien activado abre la reja
+    # mas cercana (la percepcion no dice que reja abre cual boton).
+    covered = world.buttons & (world.rocks | {player})
+    new_pressed = covered - world.pressed
+    gates = world.gates
+    pressed = world.pressed
+    if new_pressed:
+        pressed = frozenset(world.pressed | new_pressed)
+        for button in sorted(new_pressed):
+            gates = _open_nearest_gate(replace(world, gates=gates), button)
+    exit_unlocked = world.exit_unlocked or (
+        world.exit is not None and not diamonds
+    )
+
+    if (
+        diamonds == world.diamonds
+        and keys == world.keys
+        and pressed == world.pressed
+        and gates == world.gates
+        and exit_unlocked == world.exit_unlocked
+    ):
         return world
     return replace(
-        world, diamonds=frozenset(diamonds), key=key, has_key=has_key
+        world,
+        diamonds=frozenset(diamonds),
+        keys=frozenset(keys),
+        has_key=has_key,
+        pressed=pressed,
+        gates=frozenset(gates),
+        exit_unlocked=exit_unlocked,
     )
 
 
@@ -305,10 +480,14 @@ def _successors(world: World):
 # ---------------------------------------------------------------
 def wall_distance_field(world: World, goals: Iterable[Cell]) -> Dict[Cell, int]:
     """
-    BFS multi-fuente desde las metas sobre la topologia "pelada" (sin
-    rocas). Distancia real en casillas para cada celda alcanzable; no
-    Manhattan: ya toma en cuenta los muros del laberinto. Los vecinos
-    salen del grafo de la percepcion (o de la grilla si no hay grafo).
+    BFS multi-fuente desde las metas sobre la topologia "pelada":
+    ignora rocas Y bloqueos dinamicos (hoyos, rejas, puertas, salida
+    bloqueada). Distancia real en casillas (no Manhattan): ya toma en
+    cuenta los muros del laberinto. Al ignorar lo que puede despejarse
+    (rellenar un hoyo, abrir una reja), subestima el costo real ->
+    heuristica ADMISIBLE; y permite que A* encuentre metas detras de un
+    bloqueo resoluble. Los vecinos salen del grafo de la percepcion (o
+    de la grilla si no hay grafo).
     """
     dist: Dict[Cell, int] = {}
     queue = deque()
@@ -345,18 +524,111 @@ def heuristic(world: World, goals: FrozenSet[Cell]) -> float:
 # ---------------------------------------------------------------
 # A*
 # ---------------------------------------------------------------
+def _state_key(world: World) -> tuple:
+    """
+    Clave de deduplicacion de un estado de busqueda. Incluye TODO el
+    estado dinamico relevante (no solo posicion y rocas): dos mundos con
+    el mismo personaje y rocas pero distinto inventario/rejas/hoyos NO
+    son el mismo estado.
+    """
+    return (
+        world.player,
+        world.rocks,
+        world.diamonds,
+        world.keys,
+        world.has_key,
+        world.buttons,
+        world.pressed,
+        world.gates,
+        world.holes,
+        world.exit_unlocked,
+    )
+
+
+def _reached(world: World, goals: FrozenSet[Cell]) -> bool:
+    """
+    El subobjetivo esta resuelto: o el personaje esta encima, o la meta
+    es un boton ya activado (basta con que lo cubra una roca).
+    """
+    return world.player in goals or bool(goals & world.pressed)
+
+
+def _successes_for(name: str, goals: FrozenSet[Cell]) -> List[Callable[[World], bool]]:
+    """
+    Predicados de exito de un subobjetivo, en orden de preferencia.
+
+    Para diamantes/llaves se prefiere PISAR la meta (deja las rocas
+    libres) y, si eso no es posible, se acepta que el objeto haya
+    DESAPARECIDO (un diamante tambien se recoge empujando una roca
+    encima). Botones y salida requieren al personaje encima (o el boton
+    activado).
+    """
+    if name.startswith("diamante"):
+        return [
+            lambda world: world.player in goals,
+            lambda world: not (goals & world.diamonds),
+        ]
+    if name.startswith("llave"):
+        return [
+            lambda world: world.player in goals,
+            lambda world: not (goals & world.keys),
+        ]
+    if name.startswith("hoyo"):
+        # Un hoyo esta "resuelto" cuando se rellena (desaparece de la capa).
+        return [lambda world: not (goals & world.holes)]
+    return [lambda world: _reached(world, goals)]
+
+
+def _bare_path(world: World, target: Cell) -> Optional[List[Cell]]:
+    """
+    Camino mas corto del personaje a `target` sobre la topologia "pelada"
+    (ignora rocas y bloqueos dinamicos, igual que la heuristica). Se usa
+    para descubrir que hoyos cortan el paso a una meta. Devuelve la lista
+    de celdas desde el personaje (inclusive) hasta la meta, o None.
+    """
+    prev: Dict[Cell, Optional[Cell]] = {world.player: None}
+    queue = deque([world.player])
+    while queue:
+        cell = queue.popleft()
+        if cell == target:
+            break
+        for neighbor in _neighbors(world, cell):
+            if (
+                world.in_bounds(neighbor)
+                and neighbor not in world.walls
+                and neighbor not in prev
+            ):
+                prev[neighbor] = cell
+                queue.append(neighbor)
+    if target not in prev:
+        return None
+    path = []
+    cell: Optional[Cell] = target
+    while cell is not None:
+        path.append(cell)
+        cell = prev[cell]
+    path.reverse()
+    return path
+
+
 def a_star(
     world: World,
     goals: FrozenSet[Cell],
     max_nodes: int = config.MAX_NODES_ASTAR,
+    weight: float = config.A_STAR_WEIGHT,
+    success: Optional[Callable[[World], bool]] = None,
 ) -> Optional[Tuple[List[Action], World]]:
     """
-    A* sobre el espacio de mundos completos. Devuelve (actions,
-    final_world) o None si no encuentra solucion dentro del presupuesto
-    de nodos. Mueve, empuja rocas y queda parado sobre la meta
-    (recolectandola si es diamante/llave).
+    A* ponderado sobre el espacio de mundos completos. Devuelve
+    (actions, final_world) o None si no encuentra solucion dentro del
+    presupuesto. Con `weight>1` el sesgo hacia la meta es mas fuerte:
+    encuentra plan antes (a cambio de perder optimalidad), util en los
+    puzzles Sokoban de los niveles finales. Mueve, empuja rocas, rellena
+    hoyos y alcanza la meta. `success` permite definir cuando el
+    subobjetivo esta logrado (por defecto, pisar la meta).
     """
-    if world.player in goals:
+    reached = success or (lambda w: _reached(w, goals))
+    if reached(world):
         return [], _collect(world)
 
     field = wall_distance_field(world, goals)
@@ -364,24 +636,24 @@ def a_star(
         return None
 
     open_heap: List[Tuple[float, float, int, World, Tuple[Action, ...]]] = []
-    heapq.heappush(open_heap, (field[world.player], 0.0, 0, world, ()))
-    visited: Set[Tuple[Cell, FrozenSet[Cell]]] = set()
+    heapq.heappush(open_heap, (weight * field[world.player], 0.0, 0, world, ()))
+    visited: Set[tuple] = set()
     counter = 1
     nodes = 0
 
     while open_heap and nodes < max_nodes:
         _f, g, _c, current, plan = heapq.heappop(open_heap)
-        key = (current.player, current.rocks)
+        key = _state_key(current)
         if key in visited:
             continue
         visited.add(key)
         nodes += 1
 
-        if current.player in goals:
+        if reached(current):
             return list(plan), current
 
         for action, successor in _successors(current):
-            state_key = (successor.player, successor.rocks)
+            state_key = _state_key(successor)
             if state_key in visited:
                 continue
             h = field.get(successor.player, float("inf"))
@@ -390,7 +662,7 @@ def a_star(
             counter += 1
             heapq.heappush(
                 open_heap,
-                (g + 1 + h, h, counter, successor, plan + (action,)),
+                (g + 1 + weight * h, g + 1, counter, successor, plan + (action,)),
             )
 
     return None
@@ -404,41 +676,37 @@ def backtracking_search(
     goals: FrozenSet[Cell],
     max_nodes: int = config.MAX_NODES_BACKTRACK,
     max_depth: int = config.MAX_DEPTH,
+    success: Optional[Callable[[World], bool]] = None,
 ) -> Optional[Tuple[List[Action], World]]:
     """
     DFS con backtracking sobre el espacio de mundos. Prioriza las
     acciones que empujan rocas (para desbloquear corredores) y se
     deshace de ramas sin salida con `visited` + tope de profundidad.
     """
-    if world.player in goals:
+    reached = success or (lambda w: _reached(w, goals))
+    if reached(world):
         return [], _collect(world)
 
-    visited: Set[Tuple[Cell, FrozenSet[Cell], FrozenSet[Cell], bool]] = set()
+    visited: Set[tuple] = set()
     stack: List[Tuple[World, Tuple[Action, ...], int]] = [(world, (), 0)]
     nodes = 0
 
     while stack and nodes < max_nodes:
         current, plan, depth = stack.pop()
-        key = (current.player, current.rocks, current.diamonds, current.has_key)
+        key = _state_key(current)
         if key in visited:
             continue
         visited.add(key)
         nodes += 1
         if depth >= max_depth:
             continue
-        if current.player in goals:
+        if reached(current):
             return list(plan), current
 
         # Empujes primero: es lo que desbloquea el camino bloqueado.
         successors = sorted(_successors(current), key=lambda s: s[0].kind != "push")
         for action, successor in reversed(successors):
-            skey = (
-                successor.player,
-                successor.rocks,
-                successor.diamonds,
-                successor.has_key,
-            )
-            if skey in visited:
+            if _state_key(successor) in visited:
                 continue
             stack.append((successor, plan + (action,), depth + 1))
 
@@ -450,16 +718,25 @@ def backtracking_search(
 # ---------------------------------------------------------------
 def _goals_of(world: World):
     """
-    Secuencia de subobjetivos segun el contenido del nivel. Cada
-    diamante es un subobjetivo individual: si uno queda inalcanzable
-    se marca pendiente sin perder la planificacion del resto, la llave
-    y la salida.
+    Secuencia de subobjetivos segun el contenido del nivel:
+
+    1) llaves (abren las puertas, que pueden tapar el resto);
+    2) botones (abren las rejas, que pueden tapar el resto);
+    3) cada diamante, uno por uno;
+    4) la salida, SOLO cuando ya no quedan diamantes.
+
+    Cada subobjetivo es individual: si uno queda inalcanzable se marca
+    pendiente sin perder la planificacion del resto.
     """
+    for cell in sorted(world.keys):
+        yield f"llave {cell}", frozenset({cell})
+    for cell in sorted(world.buttons):
+        if cell in world.pressed:
+            continue
+        yield f"boton {cell}", frozenset({cell})
     for cell in sorted(world.diamonds):
         yield f"diamante {cell}", frozenset({cell})
-    if world.key is not None and not world.has_key:
-        yield "llave", frozenset({world.key})
-    if world.exit is not None:
+    if world.exit is not None and world.exit_unlocked:
         yield "salida", frozenset({world.exit})
 
 
@@ -480,21 +757,46 @@ class Planner:
     max_depth: int = config.MAX_DEPTH
 
     def plan(self, world: World) -> Plan:
-        pending: List[str] = []
         actions: List[Action] = []
-        # Metas que ya fracasaron (inalcanzables con el modelo): no se
-        # vuelven a intentar en cada re-encolado.
+        # El mundo del planificador arranca tras recolectar lo que el
+        # personaje ya pisa (y desbloqueando la salida si no hay gemas).
+        current = _collect(world)
+        # Metas que ya fracasaron en el mundo actual: no se reintentan
+        # mientras el mundo no avance.
         failed: Set[FrozenSet[Cell]] = set()
-        current = world
+        pending: List[str] = []
+
+        def mark_pending(name: str) -> None:
+            if name not in pending:
+                pending.append(name)
 
         def enqueue() -> deque:
-            # Metas pendientes del mundo actual, SIN las que el
-            # personaje ya esta pisando ni las que ya fracasaron.
+            # Metas del mundo actual, SIN las que ya estan logradas ni
+            # las que ya fracasaron.
             return deque(
                 (name, goals)
                 for name, goals in _goals_of(current)
-                if current.player not in goals and goals not in failed
+                if not any(s(current) for s in _successes_for(name, goals))
+                and goals not in failed
             )
+
+        def resolve(name: str, goals: FrozenSet[Cell], astar_budget: int):
+            # Prueba los predicados de exito en orden: primero "pisar la
+            # meta", luego "el objeto desaparecio". Para cada uno intenta
+            # A* y, si no hay camino, el retroceso.
+            for success in _successes_for(name, goals):
+                result = a_star(current, goals, astar_budget, success=success)
+                if result is None:
+                    result = backtracking_search(
+                        current,
+                        goals,
+                        self.max_nodes_backtrack,
+                        self.max_depth,
+                        success=success,
+                    )
+                if result is not None:
+                    return result
+            return None
 
         queue = enqueue()
         while queue:
@@ -503,22 +805,49 @@ class Planner:
             # nodo de piso alcanzable jamas se puede resolver, asi que
             # se marca pendiente sin gastar presupuesto de busqueda.
             if current.nodes and not goals <= current.nodes:
-                pending.append(name)
+                mark_pending(name)
                 failed.add(frozenset(goals))
                 continue
-            result = a_star(current, goals, self.max_nodes_astar)
+            # Hoyos abiertos que cortan el camino "pelado" a esta meta
+            # (macro de Sokoban: habra que rellenarlos). Si los hay, se
+            # intenta resolver con presupuesto pequeno y, si falla, se
+            # expande en subobjetivos de relleno.
+            target = next(iter(goals), None)
+            path = (
+                _bare_path(current, target)
+                if target is not None
+                and current.holes
+                and not name.startswith("hoyo")
+                else None
+            )
+            blockers = [c for c in path if c in current.holes] if path else []
+            budget = (
+                config.MAX_NODES_HOLE
+                if (blockers or name.startswith("hoyo"))
+                else self.max_nodes_astar
+            )
+            result = resolve(name, goals, budget)
             if result is None:
-                result = backtracking_search(
-                    current, goals, self.max_nodes_backtrack, self.max_depth
-                )
-            if result is None:
-                pending.append(name)
+                new_blockers = [
+                    h for h in blockers if frozenset({h}) not in failed
+                ]
+                if new_blockers:
+                    items = [
+                        (f"hoyo {h}", frozenset({h})) for h in new_blockers
+                    ] + [(name, goals)]
+                    for item in reversed(items):
+                        queue.appendleft(item)
+                    continue
+                mark_pending(name)
                 failed.add(frozenset(goals))
                 continue  # pasar a la siguiente meta; el mundo no cambia
             steps, current = result
             actions.extend(steps)
-            # El mundo avanzo (p. ej. se recolecto un diamante):
-            # recomputar las metas restantes sobre el estado nuevo.
+            if name in pending:
+                pending.remove(name)
+            # El mundo avanzo de forma monotona (se recolecto algo, se
+            # abrio una reja...): reintentar lo que antes habia fallado.
+            failed.clear()
             queue = enqueue()
 
         return Plan(

@@ -12,8 +12,21 @@ from collections import defaultdict
 import numpy as np
 import pytest
 
-from computation.compute import Planner, World, simulate, world_from_state
+from computation.compute import (
+    Planner,
+    World,
+    _collect,
+    _goals_of,
+    a_star,
+    simulate,
+    world_from_state,
+)
 from perception.state import DetectedObject, GameState
+
+
+def _corredor(walls_filas, cols=5):
+    """Paredes de las filas indicadas (para forzar un corredor en la fila 1)."""
+    return frozenset((r, c) for r in walls_filas for c in range(cols))
 
 
 def _bidireccional(edges):
@@ -102,6 +115,7 @@ def test_wall_distance_field_usa_grafo():
         cols=3,
         player=(0, 0),
         exit=(1, 1),
+        exit_unlocked=True,
         nodes=frozenset(adjacency),
         adjacency=adjacency,
     )
@@ -208,3 +222,141 @@ def test_recognize_y_plan_consistente():
     if plan.initial_world is not None:
         simulate(plan.initial_world, plan.actions)
     assert plan.final_world is not None
+
+
+# ---------------------------------------------------------------
+# Mecanicas del juego (hoyo+roca, boton/reja, llave/puerta, salida)
+# ---------------------------------------------------------------
+def test_hoyo_se_rellena_con_roca():
+    """
+    Corredor bloqueado por una roca delante de un hoyo: la unica forma
+    de pasar es empujar la roca DENTRO del hoyo (rellenandolo). Sin esta
+    mecánica el nivel era irresoluble.
+    """
+    world = World(
+        rows=3,
+        cols=5,
+        player=(1, 0),
+        rocks=frozenset({(1, 1)}),
+        holes=frozenset({(1, 2)}),
+        diamonds=frozenset({(1, 4)}),
+        walls=_corredor([0, 2]),
+    )
+    plan = Planner().plan(world)
+
+    assert plan.complete
+    assert any(action.kind == "push" for action in plan.actions)
+    assert plan.final_world.player == (1, 4)
+    assert not plan.final_world.diamonds
+    assert (1, 2) not in plan.final_world.holes  # hoyo rellenado
+    assert simulate(world, plan.actions).player == (1, 4)
+
+
+def test_roca_sobre_diamante_lo_recolecta():
+    """Empujar una roca hacia una casilla con diamante lo recolecta."""
+    world = World(
+        rows=3,
+        cols=5,
+        player=(1, 0),
+        rocks=frozenset({(1, 1)}),
+        diamonds=frozenset({(1, 2)}),
+        walls=_corredor([0, 2]),
+    )
+    plan = Planner().plan(world)
+
+    assert plan.complete
+    assert not plan.final_world.diamonds
+    final = simulate(world, plan.actions)
+    assert not final.diamonds          # el diamante quedo recolectado
+    assert (1, 1) not in final.rocks   # la roca se movio de su sitio inicial
+
+
+def test_boton_abre_reja():
+    """Un boton en el camino abre la reja que bloquea el diamante."""
+    world = World(
+        rows=3,
+        cols=5,
+        player=(1, 0),
+        buttons=frozenset({(1, 1)}),
+        gates=frozenset({(1, 2)}),
+        diamonds=frozenset({(1, 4)}),
+        walls=_corredor([0, 2]),
+    )
+    plan = Planner().plan(world)
+
+    assert plan.complete
+    assert plan.final_world.player == (1, 4)
+    assert not plan.final_world.gates  # reja abierta
+    assert simulate(world, plan.actions).player == (1, 4)
+
+
+def test_roca_sobre_boton_abre_reja():
+    """Un boton es placa de presion: una roca encima tambien lo activa."""
+    muros = _corredor([0, 3], cols=6) | {(1, 0), (2, 0)}
+    world = World(
+        rows=4,
+        cols=6,
+        player=(1, 1),
+        rocks=frozenset({(2, 2)}),
+        buttons=frozenset({(2, 3)}),
+        gates=frozenset({(1, 4)}),
+        diamonds=frozenset({(1, 5)}),
+        walls=muros,
+    )
+    plan = Planner().plan(world)
+
+    assert plan.complete
+    assert not plan.final_world.gates
+    assert (2, 3) in plan.final_world.pressed
+    assert simulate(world, plan.actions).player == (1, 5)
+
+
+def test_llave_abre_puerta():
+    """Recoger la llave habilita la door_key que bloquea el diamante."""
+    world = World(
+        rows=3,
+        cols=5,
+        player=(1, 0),
+        keys=frozenset({(1, 1)}),
+        doors=frozenset({(1, 2)}),
+        diamonds=frozenset({(1, 4)}),
+        walls=_corredor([0, 2]),
+    )
+    plan = Planner().plan(world)
+
+    assert plan.complete
+    assert plan.final_world.has_key
+    assert plan.final_world.player == (1, 4)
+    assert simulate(world, plan.actions).player == (1, 4)
+
+
+def test_salida_no_es_meta_hasta_reunir_diamantes():
+    """La salida solo entra como meta con 0 diamantes."""
+    world = World(
+        rows=1,
+        cols=5,
+        player=(0, 0),
+        diamonds=frozenset({(0, 2)}),
+        exit=(0, 4),
+    )
+    nombres = [name for name, _ in _goals_of(world)]
+    assert "salida" not in nombres
+
+    world_sin_gemas = _collect(World(rows=1, cols=5, player=(0, 0), exit=(0, 4)))
+    nombres = [name for name, _ in _goals_of(world_sin_gemas)]
+    assert "salida" in nombres
+
+    plan = Planner().plan(world)
+    assert plan.complete
+    assert plan.final_world.exit_unlocked
+    assert plan.final_world.player == (0, 4)
+
+
+def test_a_star_devuelve_camino_optimo():
+    """Regresion del bug de g: en terreno abierto A* debe dar la distancia real."""
+    world = World(rows=5, cols=5, player=(0, 0), exit=(4, 4), exit_unlocked=True)
+    result = a_star(world, frozenset({(4, 4)}))
+
+    assert result is not None
+    actions, _final = result
+    assert len(actions) == 8  # Manhattan exacta (4+4)

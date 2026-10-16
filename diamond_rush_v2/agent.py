@@ -97,8 +97,11 @@ class Agent:
         verify: bool = True,
     ) -> Plan:
         """
-        Envia por teclado las acciones del plan (control) y verifica
-        progreso re-percibiendo. Si no hay teclado, solo simula.
+        Envia por teclado las acciones del plan (control) y cierra el
+        lazo: si se pide verificacion por paso, tras cada flecha re-
+        percibe y compara la celda real con la esperada; si difieren,
+        RE-PLANIFICA sobre el estado percibido y continua. Si no hay
+        teclado, solo simula.
         """
         plan = plan or self.plan
         if plan is None:
@@ -110,14 +113,40 @@ class Agent:
             print("No hay teclado configurado: no se ejecuta (solo plan).")
             return plan
 
-        expected_cells = self._expected_cells(plan)
         self.keyboard.focus()
-
-        for i, action in enumerate(plan.actions, 1):
-            print(f"[{i:>4}/{plan.length}] {action.text()}")
+        index = 0
+        replans = 0
+        while index < plan.length:
+            expected_cells = self._expected_cells(plan)
+            action = plan.actions[index]
+            prev_cell = (
+                plan.initial_world.player
+                if index == 0
+                else expected_cells[index - 1]
+            )
+            expected_cell = expected_cells[index]
+            print(f"[{index + 1:>4}/{plan.length}] {action.text()}")
             self.keyboard.move(action.direction, pause=pause)
-            if verify and self.verify_each_step:
-                self._verify_live(expected_cells[i - 1], plan)
+            index += 1
+
+            if not (verify and self.verify_each_step):
+                continue
+            state = self._settle(prev_cell, expected_cell)
+            if state is None or state.player_cell == expected_cell:
+                continue
+
+            print(
+                f"PROGRESO INESPERADO: personaje en {state.player_cell}, "
+                f"se esperaba {expected_cell}. Re-planifico."
+            )
+            replans += 1
+            if replans > config.MAX_REPLANS:
+                print("Demasiadas re-planificaciones seguidas; se aborta.")
+                break
+            self.world = world_from_state(state)
+            plan = self.planner.plan(self.world)
+            self.plan = plan
+            index = 0
 
         if verify:
             self._verify_final(plan)
@@ -160,21 +189,44 @@ class Agent:
             if not match:
                 print("ADVERTENCIA: la simulacion del plan difiere de lo esperado.")
 
-    def _verify_live(self, expected_cell, plan: Plan) -> None:
-        """Re-percibe (1 frame) y compara la celda real con la esperada."""
+    def _try_perceive(self) -> Optional[GameState]:
+        """Re-percibe (1 frame); None si no se puede (transicion/fin de nivel)."""
         try:
-            state = self.perceive()
+            return self.perceive()
         except RuntimeError:
-            return  # pantalla de transicion/nivel terminado: no es fallo
-        if state.player_cell != expected_cell:
-            print(
-                f"PROGRESO INESPERADO: personaje en {state.player_cell}, "
-                f"se esperaba {expected_cell}."
-            )
-            if plan.complete:
-                print("Se re-planifica sobre el estado percibido.")
-                self.world = world_from_state(state)
-                self.plan = self.planner.plan(self.world)
+            return None
+
+    def _settle(
+        self, prev_cell: tuple, expected_cell: tuple
+    ) -> Optional[GameState]:
+        """
+        Re-percibe tras un movimiento hasta que la celda del personaje se
+        asiente (deje de cambiar) o se agote el tiempo.
+
+        Evita leer un frame a mitad de la animacion: si se comparara contra
+        la celda esperada con la animacion a medias, se creeria que hubo
+        desvio y se reenviaria la misma flecha (doble movimiento). Devuelve
+        el ultimo GameState percibido, o None si no se pudo percibir.
+        """
+        deadline = time.perf_counter() + config.SETTLE_TIMEOUT
+        last = self._try_perceive()
+        while last is not None and time.perf_counter() < deadline:
+            cell = last.player_cell
+            if cell == expected_cell:
+                return last
+            time.sleep(config.SETTLE_POLL)
+            current = self._try_perceive()
+            if current is None:
+                return last
+            if current.player_cell == cell:
+                # Celda estable. Si sigue en la de partida puede ser que la
+                # animacion aun no haya arrancado: se sigue esperando hasta
+                # el timeout (si el movimiento esta bloqueado, se devuelve
+                # la ultima lectura al agotarse el tiempo).
+                if cell != prev_cell:
+                    return current
+            last = current
+        return last
 
     def _verify_final(self, plan: Plan) -> None:
         print("-" * 60)
