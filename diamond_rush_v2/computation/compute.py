@@ -34,8 +34,8 @@ nunca de cv2 ni de recognition.py.
 """
 import heapq
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Dict, FrozenSet, Iterable, Iterator, List, Optional, Set, Tuple
 
 import config
 from perception.state import GameState
@@ -72,6 +72,14 @@ class World:
     intransitables (pared, hoyo, picos: los peligros del juego se
     modelan como obstaculos); `rocks` son celdas ocupadas por una roca
     empujable; `diamonds` son los diamantes por recolectar.
+
+    `nodes` y `adjacency` son el grafo de piso que aporta la percepcion
+    (GameState): la topologia "pelada" (ignora objetos) de celdas de
+    suelo alcanzables desde el personaje. Se usan para generar vecinos
+    y para el campo de distancias, pero NO reemplazan a `walls`: un
+    peligro es piso en `adjacency` y aun asi debe bloquear. Si el grafo
+    viene vacio (p. ej. fixtures de test), se cae al vecindario por
+    `DELTA` sobre la grilla.
     """
 
     rows: int
@@ -83,6 +91,8 @@ class World:
     key: Optional[Cell] = None
     has_key: bool = False
     exit: Optional[Cell] = None
+    nodes: FrozenSet[Cell] = frozenset()
+    adjacency: Dict[Cell, List[Cell]] = field(default_factory=dict)
 
     def in_bounds(self, cell: Cell) -> bool:
         return 0 <= cell[0] < self.rows and 0 <= cell[1] < self.cols
@@ -179,7 +189,47 @@ def world_from_state(state: GameState, roles: Optional[Dict[str, str]] = None) -
         key=key,
         has_key=False,
         exit=exit_cell,
+        nodes=frozenset(state.graph_nodes),
+        adjacency=state.adjacency,
     )
+
+
+# ---------------------------------------------------------------
+# Topologia: el grafo de la percepcion, con fallback a la grilla
+# ---------------------------------------------------------------
+def _neighbors(world: World, cell: Cell) -> Iterable[Cell]:
+    """
+    Vecinos de piso de una celda. Si el World trae el grafo de la
+    percepcion, se usan sus aristas; si no, se derivan de la grilla con
+    `DELTA` (comportamiento previo, para fixtures sin grafo).
+    """
+    if world.adjacency:
+        return world.adjacency.get(cell, ())
+    return (neighbor for neighbor in _grid_neighbors(world, cell))
+
+
+def _grid_neighbors(world: World, cell: Cell) -> Iterable[Cell]:
+    """Vecinos de 4 direcciones derivados de la grilla (sin el grafo)."""
+    for df, dc in DELTA.values():
+        neighbor = (cell[0] + df, cell[1] + dc)
+        if world.in_bounds(neighbor) and neighbor not in world.walls:
+            yield neighbor
+
+
+def _is_floor(world: World, cell: Cell) -> bool:
+    """La celda existe como piso transitable (no es muro ni esta fuera)."""
+    if cell in world.walls or not world.in_bounds(cell):
+        return False
+    if world.nodes and cell not in world.nodes:
+        return False
+    return True
+
+
+def _connected(world: World, origin: Cell, target: Cell) -> bool:
+    """Hay un paso directo de piso entre dos celdas: son vecinas en la topologia."""
+    if world.adjacency:
+        return target in world.adjacency.get(origin, ())
+    return target in set(_grid_neighbors(world, origin))
 
 
 # ---------------------------------------------------------------
@@ -194,15 +244,18 @@ def _step(world: World, direction: str) -> Optional[Tuple[Action, World]]:
     origin = world.player
     target = (origin[0] + d[0], origin[1] + d[1])
 
-    if not world.in_bounds(target) or target in world.walls:
+    # La topologia la manda el grafo de piso (o la grilla si no hay):
+    # el destino tiene que ser una celda de piso conectada y no un
+    # peligro/fijo (`walls`).
+    if not _connected(world, origin, target) or not _is_floor(world, target):
         return None
 
     if target in world.rocks:
         # Empujar la roca a la celda de mas alla.
         push = (target[0] + d[0], target[1] + d[1])
         if (
-            not world.in_bounds(push)
-            or push in world.walls
+            not _connected(world, target, push)
+            or not _is_floor(world, push)
             or push in world.rocks
             # No empujar una roca sobre recolectables ni sobre la salida.
             or push in world.diamonds
@@ -218,17 +271,7 @@ def _step(world: World, direction: str) -> Optional[Tuple[Action, World]]:
         player = target
         kind = "move"
 
-    new = World(
-        rows=world.rows,
-        cols=world.cols,
-        walls=world.walls,
-        rocks=rocks,
-        player=player,
-        diamonds=world.diamonds,
-        key=world.key,
-        has_key=world.has_key,
-        exit=world.exit,
-    )
+    new = replace(world, rocks=rocks, player=player)
     return Action(kind, direction), new
 
 
@@ -242,16 +285,8 @@ def _collect(world: World) -> World:
         has_key = True
     if diamonds == world.diamonds and key == world.key:
         return world
-    return World(
-        rows=world.rows,
-        cols=world.cols,
-        walls=world.walls,
-        rocks=world.rocks,
-        player=world.player,
-        diamonds=frozenset(diamonds),
-        key=key,
-        has_key=has_key,
-        exit=world.exit,
+    return replace(
+        world, diamonds=frozenset(diamonds), key=key, has_key=has_key
     )
 
 
@@ -270,9 +305,10 @@ def _successors(world: World):
 # ---------------------------------------------------------------
 def wall_distance_field(world: World, goals: Iterable[Cell]) -> Dict[Cell, int]:
     """
-    BFS multi-fuente desde las metas sobre la grilla "pelada" (sin
-    rocas). Distancia real en casillas para cada celda alcanzable;
-    no Manhattan: ya toma en cuenta los muros del laberinto.
+    BFS multi-fuente desde las metas sobre la topologia "pelada" (sin
+    rocas). Distancia real en casillas para cada celda alcanzable; no
+    Manhattan: ya toma en cuenta los muros del laberinto. Los vecinos
+    salen del grafo de la percepcion (o de la grilla si no hay grafo).
     """
     dist: Dict[Cell, int] = {}
     queue = deque()
@@ -283,8 +319,7 @@ def wall_distance_field(world: World, goals: Iterable[Cell]) -> Dict[Cell, int]:
 
     while queue:
         cell, d = queue.popleft()
-        for df, dc in DELTA.values():
-            neighbor = (cell[0] + df, cell[1] + dc)
+        for neighbor in _neighbors(world, cell):
             if (
                 world.in_bounds(neighbor)
                 and neighbor not in world.walls
@@ -464,6 +499,13 @@ class Planner:
         queue = enqueue()
         while queue:
             name, goals = queue.popleft()
+            # Pruning con el grafo de la percepcion: una meta que no es
+            # nodo de piso alcanzable jamas se puede resolver, asi que
+            # se marca pendiente sin gastar presupuesto de busqueda.
+            if current.nodes and not goals <= current.nodes:
+                pending.append(name)
+                failed.add(frozenset(goals))
+                continue
             result = a_star(current, goals, self.max_nodes_astar)
             if result is None:
                 result = backtracking_search(
