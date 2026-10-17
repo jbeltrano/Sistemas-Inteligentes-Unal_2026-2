@@ -91,7 +91,9 @@ class World:
     - `pressed`: botones ya activados (por el personaje o por una roca).
     - `doors`: puertas con cerradura (bloquean hasta tener una llave).
     - `keys`: llaves sueltas por recoger.
-    - `has_key`: el personaje ya tiene alguna llave (habilita `doors`).
+    - `has_key`: el personaje lleva una llave (habilita `doors`). Lleva
+      como maximo UNA: abrir una puerta la consume (vuelve a `False`) y
+      pisar otra llave mientras se lleva una no la recoge.
     - `exit`: celda de la salida (escape/totem); bloquea hasta que no
       queden diamantes (`exit_unlocked`).
     - `exit_unlocked`: la salida ya es transitable (0 diamantes).
@@ -245,7 +247,12 @@ def world_from_state(state: GameState, roles: Optional[Dict[str, str]] = None) -
         button_gate=_match_buttons_to_gates(buttons, gates),
         doors=frozenset(doors),
         keys=frozenset(keys),
-        has_key=False,
+        # Capacidad 1 + consumo: como el nivel tiene igual numero de
+        # llaves y puertas (K0 == D0), si quedan mas puertas cerradas que
+        # llaves en el piso, la que falta la lleva el personaje. Esto
+        # reconstruye has_key en cualquier re-plan sin mirar la mano del
+        # personaje (ver _collect).
+        has_key=(len(doors) - len(keys) == 1),
         exit=exit_cell,
         exit_unlocked=False,
         nodes=frozenset(state.graph_nodes),
@@ -423,14 +430,27 @@ def _open_nearest_gate(world: World, button: Cell) -> FrozenSet[Cell]:
 
 def _collect(world: World) -> World:
     """
-    Ultima transicion tras pisar una celda: recoge diamantes/llaves,
-    activa botones (por el personaje o por una roca encima) y desbloquea
-    la salida al no quedar diamantes.
+    Ultima transicion tras pisar una celda: recoge diamantes y llaves,
+    abre puertas, activa botones (por el personaje o por una roca encima)
+    y desbloquea la salida al no quedar diamantes.
+
+    El personaje lleva UNA sola llave: pisar una puerta la abre (se quita
+    de `doors`) y consume la llave; pisar una llave solo la recoge si no
+    se lleva ninguna (si ya se lleva, la del piso queda intacta).
     """
     player = world.player
     diamonds = world.diamonds - {player}
-    keys = world.keys - {player}
-    has_key = world.has_key or player in world.keys
+    keys = world.keys
+    doors = world.doors
+    has_key = world.has_key
+    # Abrir la puerta pisada consume la llave que se lleva.
+    if player in doors and has_key:
+        doors = doors - {player}
+        has_key = False
+    # Recoger una llave solo si no se lleva ninguna (capacidad 1).
+    if player in keys and not has_key:
+        keys = keys - {player}
+        has_key = True
     # Un boton es una placa de presion: se activa si lo pisa el personaje
     # o si queda una roca encima. Cada boton recien activado abre la reja
     # mas cercana (la percepcion no dice que reja abre cual boton).
@@ -449,6 +469,8 @@ def _collect(world: World) -> World:
     if (
         diamonds == world.diamonds
         and keys == world.keys
+        and doors == world.doors
+        and has_key == world.has_key
         and pressed == world.pressed
         and gates == world.gates
         and exit_unlocked == world.exit_unlocked
@@ -458,6 +480,7 @@ def _collect(world: World) -> World:
         world,
         diamonds=frozenset(diamonds),
         keys=frozenset(keys),
+        doors=frozenset(doors),
         has_key=has_key,
         pressed=pressed,
         gates=frozenset(gates),
@@ -540,6 +563,7 @@ def _state_key(world: World) -> tuple:
         world.buttons,
         world.pressed,
         world.gates,
+        world.doors,
         world.holes,
         world.exit_unlocked,
     )
@@ -557,10 +581,12 @@ def _successes_for(name: str, goals: FrozenSet[Cell]) -> List[Callable[[World], 
     """
     Predicados de exito de un subobjetivo, en orden de preferencia.
 
-    Para diamantes/llaves se prefiere PISAR la meta (deja las rocas
-    libres) y, si eso no es posible, se acepta que el objeto haya
-    DESAPARECIDO (un diamante tambien se recoge empujando una roca
-    encima). Botones y salida requieren al personaje encima (o el boton
+    Para diamantes se prefiere PISAR la meta (deja las rocas libres) y,
+    si eso no es posible, se acepta que el objeto haya DESAPARECIDO (un
+    diamante tambien se recoge empujando una roca encima). Para llaves
+    solo vale la DESAPARICION: como el personaje lleva una sola, pisar
+    la celda de otra llave no la recoge, asi que "pisar" daria un falso
+    positivo. Botones y salida requieren al personaje encima (o el boton
     activado).
     """
     if name.startswith("diamante"):
@@ -569,10 +595,7 @@ def _successes_for(name: str, goals: FrozenSet[Cell]) -> List[Callable[[World], 
             lambda world: not (goals & world.diamonds),
         ]
     if name.startswith("llave"):
-        return [
-            lambda world: world.player in goals,
-            lambda world: not (goals & world.keys),
-        ]
+        return [lambda world: not (goals & world.keys)]
     if name.startswith("hoyo"):
         # Un hoyo esta "resuelto" cuando se rellena (desaparece de la capa).
         return [lambda world: not (goals & world.holes)]

@@ -76,7 +76,11 @@ MAX_NODES_HOLE = 60_000
 # pulsaciones).
 STEP_SECONDS = 0.40            # pausa entre pasos del plan (en segundos)
 PRESS_SECONDS = 0.08           # cuánto se mantiene la flecha presionada (el juego exige un mínimo)
-VERIFY_EACH_STEP = True        # re-percibir tras cada paso y re-planificar si hay desvío
+# Cada cuántos pasos re-percibir durante la ejecución (evita un pantallazo
+# por paso):
+#   N >= 1 -> verificar cada N pasos y re-planificar si hay desvío (1 = cada paso)
+#   0      -> no verificar durante la ejecución (solo el chequeo final)
+VERIFY_EVERY = 10
 MAX_REPLANS = 50               # tope de re-planificaciones seguidas antes de abortar
 # Asentado tras cada paso: se re-percibe hasta que la celda del personaje
 # deje de cambiar, para no leer un frame a mitad de la animación y creer

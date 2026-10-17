@@ -325,9 +325,56 @@ def test_llave_abre_puerta():
     plan = Planner().plan(world)
 
     assert plan.complete
-    assert plan.final_world.has_key
     assert plan.final_world.player == (1, 4)
+    # Abrir la puerta consume la llave: al final ya no se lleva ninguna.
+    assert not plan.final_world.has_key
+    assert (1, 2) not in plan.final_world.doors  # puerta abierta
     assert simulate(world, plan.actions).player == (1, 4)
+
+
+def test_no_lleva_dos_llaves_a_la_vez():
+    """
+    Capacidad 1: con dos llaves y ninguna puerta, el personaje recoge
+    una y no puede recoger la segunda (la del piso queda intacta).
+    """
+    world = World(
+        rows=1,
+        cols=5,
+        player=(0, 0),
+        keys=frozenset({(0, 1), (0, 2)}),
+    )
+    plan = Planner().plan(world)
+
+    final = plan.final_world
+    assert final.has_key                      # se lleva una
+    assert final.keys == frozenset({(0, 2)})  # la otra quedo en el piso
+    # No hay forma de resolver la segunda llave: queda pendiente.
+    assert not plan.complete
+    assert "llave (0, 2)" in plan.pending
+
+
+def test_dos_puertas_requieren_dos_llaves():
+    """
+    Dos puertas y dos llaves: hay que recoger una llave, abrir su puerta
+    (consume), recoger la otra y abrir la segunda. El plan queda completo.
+    """
+    world = World(
+        rows=1,
+        cols=7,
+        player=(0, 0),
+        keys=frozenset({(0, 1), (0, 3)}),
+        doors=frozenset({(0, 2), (0, 4)}),
+        diamonds=frozenset({(0, 6)}),
+    )
+    plan = Planner().plan(world)
+
+    assert plan.complete
+    final = plan.final_world
+    assert final.player == (0, 6)
+    assert not final.doors     # ambas puertas abiertas
+    assert not final.keys      # ambas llaves consumidas
+    assert not final.has_key
+    assert simulate(world, plan.actions).player == (0, 6)
 
 
 def test_salida_no_es_meta_hasta_reunir_diamantes():

@@ -7,7 +7,9 @@ import argparse
 import config
 
 
-def run_agent(execute: bool = True, debug: bool = False) -> None:
+def run_agent(
+    execute: bool = True, debug: bool = False, verify_every: int = None
+) -> None:
     driver = attach_driver()
     capturer = BrowserCapturer(driver)
 
@@ -17,7 +19,8 @@ def run_agent(execute: bool = True, debug: bool = False) -> None:
     capturer.locate_canvas()
     keyboard = Keyboard(driver, capturer.canvas)
 
-    agent = Agent(capturer, keyboard=keyboard, print_state=debug)
+    kwargs = {} if verify_every is None else {"verify_every": verify_every}
+    agent = Agent(capturer, keyboard=keyboard, print_state=debug, **kwargs)
     agent.run(execute=execute)
 
 
@@ -33,12 +36,22 @@ def main() -> None:
         action="store_true",
         help="imprimir el GameState completo",
     )
+    parser.add_argument(
+        "--verify-every",
+        type=int,
+        default=None,
+        help="re-percibir cada N pasos (0 = solo al final); por defecto, config.VERIFY_EVERY",
+    )
     args = parser.parse_args()
 
     # test_recognition(config.BASE_DIR / "test.png")
     # test_recognition(config.LEVELS_DIR / "level19.png")
     # test_recognition_all_levels()
-    run_agent(execute=not args.no_execute, debug=args.debug)
+    run_agent(
+        execute=not args.no_execute,
+        debug=args.debug,
+        verify_every=args.verify_every,
+    )
 
 
 if __name__ == "__main__":

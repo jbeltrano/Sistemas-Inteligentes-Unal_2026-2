@@ -36,7 +36,7 @@ class Agent:
         capturer: BrowserCapturer,
         keyboard: Optional[Keyboard] = None,
         planner: Optional[Planner] = None,
-        verify_each_step: bool = config.VERIFY_EACH_STEP,
+        verify_every: int = config.VERIFY_EVERY,
         print_state: bool = False,
     ):
         # `keyboard` es opcional y SOLO se usa al ejecutar. El plan se
@@ -45,7 +45,7 @@ class Agent:
         self.capturer = capturer
         self.keyboard = keyboard
         self.planner = planner or Planner()
-        self.verify_each_step = verify_each_step
+        self.verify_every = verify_every
         self.print_state = print_state
 
         self.state: Optional[GameState] = None
@@ -98,10 +98,11 @@ class Agent:
     ) -> Plan:
         """
         Envia por teclado las acciones del plan (control) y cierra el
-        lazo: si se pide verificacion por paso, tras cada flecha re-
-        percibe y compara la celda real con la esperada; si difieren,
-        RE-PLANIFICA sobre el estado percibido y continua. Si no hay
-        teclado, solo simula.
+        lazo: cada `verify_every` pasos re-percibe y compara la celda real
+        con la esperada; si difieren, RE-PLANIFICA sobre el estado
+        percibido y continua. Con `verify_every <= 0` no se verifica
+        durante la ejecucion (solo el chequeo final). Si no hay teclado,
+        solo simula.
         """
         plan = plan or self.plan
         if plan is None:
@@ -116,6 +117,7 @@ class Agent:
         self.keyboard.focus()
         index = 0
         replans = 0
+        since_check = 0
         while index < plan.length:
             expected_cells = self._expected_cells(plan)
             action = plan.actions[index]
@@ -129,8 +131,14 @@ class Agent:
             self.keyboard.move(action.direction, pause=pause)
             index += 1
 
-            if not (verify and self.verify_each_step):
+            since_check += 1
+            if (
+                not verify
+                or self.verify_every <= 0
+                or since_check < self.verify_every
+            ):
                 continue
+            since_check = 0
             state = self._settle(prev_cell, expected_cell)
             if state is None or state.player_cell == expected_cell:
                 continue
@@ -147,6 +155,7 @@ class Agent:
             plan = self.planner.plan(self.world)
             self.plan = plan
             index = 0
+            since_check = 0
 
         if verify:
             self._verify_final(plan)
