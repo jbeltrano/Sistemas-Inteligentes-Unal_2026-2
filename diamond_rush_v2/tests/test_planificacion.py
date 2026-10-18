@@ -17,6 +17,7 @@ from computation.compute import (
     World,
     _collect,
     _goals_of,
+    _step,
     a_star,
     simulate,
     world_from_state,
@@ -252,8 +253,12 @@ def test_hoyo_se_rellena_con_roca():
     assert simulate(world, plan.actions).player == (1, 4)
 
 
-def test_roca_sobre_diamante_lo_recolecta():
-    """Empujar una roca hacia una casilla con diamante lo recolecta."""
+def test_roca_tapa_diamante_y_el_jugador_lo_recoge():
+    """
+    Empujar una roca hacia un diamante solo lo TAPA: las rocas no
+    recolectan diamantes. El plan debe seguir completo empujando la
+    roca de nuevo y pisando la celda para que el jugador lo recoja.
+    """
     world = World(
         rows=3,
         cols=5,
@@ -262,13 +267,99 @@ def test_roca_sobre_diamante_lo_recolecta():
         diamonds=frozenset({(1, 2)}),
         walls=_corredor([0, 2]),
     )
+
+    # Empuje directo sobre el diamante: queda tapado, no recolectado.
+    pushed = _step(world, "right")
+    assert pushed is not None
+    _action, tapado = pushed
+    assert tapado.diamonds == frozenset({(1, 2)})  # el diamante sigue ahi
+    assert tapado.rocks == frozenset({(1, 2)})     # la roca lo tapa
+
     plan = Planner().plan(world)
 
     assert plan.complete
     assert not plan.final_world.diamonds
     final = simulate(world, plan.actions)
-    assert not final.diamonds          # el diamante quedo recolectado
+    assert not final.diamonds          # el jugador lo recolecto al pisar
+    assert final.player == (1, 2)
     assert (1, 1) not in final.rocks   # la roca se movio de su sitio inicial
+
+
+def test_step_no_deja_roca_atrapada_sobre_diamante():
+    """Tapa permanente de un diamante: prohibida. Tapa temporal: permitida."""
+    libs = {(1, 3), (2, 3), (3, 3), (4, 3)}
+    walls = frozenset(
+        (r, c) for r in range(5) for c in range(5) if (r, c) not in libs
+    )
+
+    # Muro mas alla del diamante: la roca quedaria atrapada encima.
+    # (solo la columna del diamante es piso; (4,3) es muro)
+    muro_mas_alla = walls | {(4, 3)} - libs  # solo (4,3) extra respecto a libs
+    world = World(
+        rows=5,
+        cols=5,
+        player=(1, 3),
+        rocks=frozenset({(2, 3)}),
+        diamonds=frozenset({(3, 3)}),
+        walls=frozenset(
+            (r, c) for r in range(5) for c in range(5) if (r, c) not in libs
+        )
+        - {(4, 3)},
+    )
+    assert _step(world, "down") is None
+
+    # Piso mas alla: tapa temporal (la roca puede salir despues).
+    abierto = World(
+        rows=5,
+        cols=5,
+        player=(1, 3),
+        rocks=frozenset({(2, 3)}),
+        diamonds=frozenset({(3, 3)}),
+    )
+    result = _step(abierto, "down")
+    assert result is not None
+    _action, tapado = result
+    assert tapado.rocks == frozenset({(3, 3)})    # roca sobre el diamante
+    assert tapado.diamonds == frozenset({(3, 3)})  # el diamante sigue ahi
+
+    # Hoyo mas alla (piso, no muro): la roca sale rellenandolo.
+    con_hoyo = World(
+        rows=5,
+        cols=5,
+        player=(1, 3),
+        rocks=frozenset({(2, 3)}),
+        diamonds=frozenset({(3, 3)}),
+        holes=frozenset({(4, 3)}),
+        walls=walls,
+    )
+    assert _step(con_hoyo, "down") is not None
+
+
+def test_no_destruye_diamante_sin_salida():
+    """
+    Regresion del nivel 4: sin la mirada un paso, el A* miope de un
+    diamante empujaba la roca del corredor hasta el ultimo diamante
+    rodeado de muros; el plan quedaba incompleto con ese diamante
+    destruido. Con la regla debe resolver por la ruta del hoyo.
+    """
+    libs = {(1, 1), (1, 2), (1, 3), (1, 4), (2, 1), (2, 3), (3, 1), (3, 2), (3, 3)}
+    world = World(
+        rows=6,
+        cols=5,
+        player=(1, 1),
+        rocks=frozenset({(1, 3), (2, 1)}),
+        diamonds=frozenset({(2, 3), (3, 3)}),
+        holes=frozenset({(3, 2)}),
+        walls=frozenset(
+            (r, c) for r in range(6) for c in range(5) if (r, c) not in libs
+        ),
+    )
+    plan = Planner().plan(world)
+
+    assert plan.complete
+    assert not plan.final_world.diamonds
+    final = simulate(world, plan.actions)
+    assert not final.diamonds
 
 
 def test_boton_abre_reja():

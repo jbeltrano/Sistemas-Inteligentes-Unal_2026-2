@@ -374,12 +374,12 @@ def _step(world: World, direction: str) -> Optional[Tuple[Action, World]]:
         return None
 
     if target in world.rocks:
-        # Empujar la roca a la celda de mas alla. Dos jugadas especiales:
-        #  - hacia un hoyo: lo rellena (la roca queda fija);
-        #  - hacia un diamante: lo recolecta (la roca ocupa su celda).
+        # Empujar la roca a la celda de mas alla. Hacia un hoyo lo
+        # rellena (la roca queda fija); hacia un diamante solo lo TAPA:
+        # las rocas no recolectan diamantes, solo el jugador al pisar la
+        # celda (ver _collect), asi que el diamante sigue en `diamonds`.
         push = (target[0] + d[0], target[1] + d[1])
         filling = push in world.holes
-        collecting = push in world.diamonds
         if not _connected(world, target, push):
             return None
         if not filling and not _is_floor(world, push):
@@ -394,17 +394,29 @@ def _step(world: World, direction: str) -> Optional[Tuple[Action, World]]:
             or push == world.exit
         ):
             return None
+        # Tapa temporal si; tapa permanente no: una roca aterrada sobre un
+        # diamante solo se permite si la celda de mas alla (misma
+        # direccion) le deja salir (piso u hoyo rellenable). Una roca
+        # atrapada sobre un diamante lo destruiria irrevocablemente (p. ej.
+        # nivel 4, donde el A* miope de un diamante empujaba la roca contra
+        # el ultimo diamante rodeado de muros y el nivel quedaba sin
+        # solucion). La tapa temporal sigue permitida porque a veces es el
+        # unico modo de atravesar un corredor de una casilla.
+        if push in world.diamonds:
+            beyond = (push[0] + d[0], push[1] + d[1])
+            can_leave = _connected(world, push, beyond) and (
+                _is_floor(world, beyond) or beyond in world.holes
+            )
+            if not can_leave:
+                return None
         holes = world.holes
-        diamonds = world.diamonds
         if filling:
             holes = frozenset(world.holes - {push})
             rocks = frozenset(world.rocks - {target})
         else:
             rocks = frozenset((world.rocks - {target}) | {push})
-            if collecting:
-                diamonds = frozenset(world.diamonds - {push})
         return Action("push", direction), replace(
-            world, rocks=rocks, holes=holes, diamonds=diamonds, player=target
+            world, rocks=rocks, holes=holes, player=target
         )
     else:
         return Action("move", direction), replace(world, player=target)
@@ -581,19 +593,15 @@ def _successes_for(name: str, goals: FrozenSet[Cell]) -> List[Callable[[World], 
     """
     Predicados de exito de un subobjetivo, en orden de preferencia.
 
-    Para diamantes se prefiere PISAR la meta (deja las rocas libres) y,
-    si eso no es posible, se acepta que el objeto haya DESAPARECIDO (un
-    diamante tambien se recoge empujando una roca encima). Para llaves
-    solo vale la DESAPARICION: como el personaje lleva una sola, pisar
-    la celda de otra llave no la recoge, asi que "pisar" daria un falso
-    positivo. Botones y salida requieren al personaje encima (o el boton
-    activado).
+    Los diamantes solo se recolecta pisando la celda: una roca puede
+    taparlos pero nunca recogerlos, asi que el unico exito posible es
+    que el personaje este encima. Para llaves solo vale la DESAPARICION:
+    como el personaje lleva una sola, pisar la celda de otra llave no la
+    recoge, asi que "pisar" daria un falso positivo. Botones y salida
+    requieren al personaje encima (o el boton activado).
     """
     if name.startswith("diamante"):
-        return [
-            lambda world: world.player in goals,
-            lambda world: not (goals & world.diamonds),
-        ]
+        return [lambda world: world.player in goals]
     if name.startswith("llave"):
         return [lambda world: not (goals & world.keys)]
     if name.startswith("hoyo"):
