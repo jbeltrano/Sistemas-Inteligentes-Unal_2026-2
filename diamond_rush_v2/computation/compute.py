@@ -93,9 +93,17 @@ class World:
     - `diamonds`: diamantes por recolectar.
     - `holes`: hoyos abiertos (bloquean salvo que se empuje una roca
       dentro; al rellenarse el hoyo pasa a piso transitable).
-    - `gates`: rejas cerradas (bloquean hasta que se pisa un boton).
+    - `gates`: rejas CERRADAS en este instante (bloquean el paso). Con
+      un solo par boton-reja la apertura es TEMPORAL: al descubrir el
+      boton la reja vuelve a entrar en esta capa (ver `_gates_actuales`).
+    - `all_gates`: todas las rejas del nivel, abiertas o cerradas
+      (constante durante las transiciones; hace de memoria para poder
+      recerrar una reja temporal).
     - `buttons`: botones (piso; placas de presion que abren una reja).
-    - `pressed`: botones ya activados (por el personaje o por una roca).
+    - `pressed`: botones cubiertos (por el personaje o por una roca).
+      En modo temporal es derivado de la cobertura actual (NO es
+      monotonico: al descubrir el boton se vacia); en modo permanente
+      (varios pares) si lo es: una reja abierta no se vuelve a cerrar.
     - `doors`: puertas con cerradura (bloquean hasta tener una llave).
     - `keys`: llaves sueltas por recoger.
     - `has_key`: el personaje lleva una llave (habilita `doors`). Lleva
@@ -123,9 +131,15 @@ class World:
     diamonds: FrozenSet[Cell] = frozenset()
     holes: FrozenSet[Cell] = frozenset()
     gates: FrozenSet[Cell] = frozenset()
+    # Todas las rejas del nivel (abiertas o cerradas). Constante durante
+    # las transiciones: es la memoria que permite RECERRAR una reja
+    # temporal al descubrir su boton. Se rellena en world_from_state y
+    # se auto-sana en _collect (all_gates | gates) para fixtures de test.
+    all_gates: FrozenSet[Cell] = frozenset()
     buttons: FrozenSet[Cell] = frozenset()
-    # Botones ya activados (por el personaje o por una roca encima). Es
-    # monotono: una reja abierta no se vuelve a cerrar.
+    # Botones cubiertos (personaje o roca encima). En modo temporal es
+    # derivado y NO monotono (una reja abierta se cierra al soltar el
+    # boton); en modo permanente (varios pares) es monotono.
     pressed: FrozenSet[Cell] = frozenset()
     # Emparejamiento boton -> reja que abre (la percepcion no lo dice; se
     # infiere por cercania global, 1:1).
@@ -257,6 +271,7 @@ def world_from_state(state: GameState, roles: Optional[Dict[str, str]] = None) -
         diamonds=frozenset(diamonds),
         holes=frozenset(holes),
         gates=frozenset(gates),
+        all_gates=frozenset(gates),
         buttons=frozenset(buttons),
         button_gate=_match_buttons_to_gates(buttons, gates),
         doors=frozenset(doors),
@@ -387,14 +402,50 @@ def _leave_spike(world: World, origin: Cell) -> World:
     )
 
 
-def _step(world: World, direction: str) -> Optional[Tuple[Action, World]]:
+def _estado_valido(world: World) -> bool:
+    """
+    True si el mundo resultante de un paso es fisicamente coherente: ni
+    el personaje ni una roca pueden quedar sobre una reja CERRADA. Con
+    rejas temporales al salir de un boton la reja se cierra, asi que no
+    vale "colarse" a la casilla de la reja en el mismo paso (entrar
+    exigia tener el boton pisado, que el propio movimiento ya no deja).
+    """
+    collected = _collect(world)
+    if collected.player in collected.gates:
+        return False
+    if collected.rocks & collected.gates:
+        return False
+    return True
+
+
+def _step(
+    world: World,
+    direction: str,
+    allow_spike_activation: bool = True,
+    allow_rock_on_diamond: bool = True,
+) -> Optional[Tuple[Action, World]]:
     """
     Aplica un movimiento o un empuje desde el estado actual.
     Devuelve (action, world) o None si la celda destino esta bloqueada.
+
+    El A* miope de un subobjetivo podria tomar decisiones irreversibles
+    sin ver las consecuencias para el resto del nivel. Dos banderas las
+    restringen cuando se planifican subobjetivos:
+
+    - `allow_spike_activation=False`: no se sale de un pico retraido
+      (activarlo lo dejaria como muro para siempre, cortando el unico
+      camino de retorno).
+    - `allow_rock_on_diamond=False`: no se empuja una roca sobre un
+      diamante (la perception ya no lo detectaria en re-verificaciones).
     """
     d = DELTA[direction]
     origin = world.player
     target = (origin[0] + d[0], origin[1] + d[1])
+
+    # En modo no destructivo no se sale de un pico: activarlo es
+    # irreversible y puede cortar el camino de vuelta.
+    if not allow_spike_activation and origin in world.spikes:
+        return None
 
     # La topologia la manda el grafo de piso (o la grilla si no hay):
     # el destino tiene que ser una celda de piso conectada y no un
@@ -432,6 +483,8 @@ def _step(world: World, direction: str) -> Optional[Tuple[Action, World]]:
         # solucion). La tapa temporal sigue permitida porque a veces es el
         # unico modo de atravesar un corredor de una casilla.
         if push in world.diamonds:
+            if not allow_rock_on_diamond:
+                return None
             beyond = (push[0] + d[0], push[1] + d[1])
             can_leave = _connected(world, push, beyond) and (
                 _is_floor(world, beyond) or beyond in world.holes
@@ -444,31 +497,72 @@ def _step(world: World, direction: str) -> Optional[Tuple[Action, World]]:
             rocks = frozenset(world.rocks - {target})
         else:
             rocks = frozenset((world.rocks - {target}) | {push})
-        return Action("push", direction), _leave_spike(
+        nuevo = _leave_spike(
             replace(world, rocks=rocks, holes=holes, player=target), origin
         )
+        if not _estado_valido(nuevo):
+            return None
+        return Action("push", direction), nuevo
     else:
-        return Action("move", direction), _leave_spike(
-            replace(world, player=target), origin
-        )
+        nuevo = _leave_spike(replace(world, player=target), origin)
+        if not _estado_valido(nuevo):
+            return None
+        return Action("move", direction), nuevo
 
 
-def _open_nearest_gate(world: World, button: Cell) -> FrozenSet[Cell]:
+def _es_temporal(world: World) -> bool:
     """
-    Activar un boton abre su reja emparejada (si sigue cerrada); si no
-    hay emparejamiento (fixtures sin `button_gate`), la reja mas cercana.
-    Al pisar todos los botones alcanzables se abren todas las rejas; el
-    lazo cerrado corrige si el juego abrio otra.
+    True cuando la apertura de la reja es TEMPORAL (hay que mantener el
+    boton cubierto: personaje o roca encima, para que la reja no se
+    cierre). Ocurre con un UNICO par boton-reja.
+
+    Con varios pares se conserva el comportamiento permanente actual
+    (pisar el boton abre su reja para siempre); si el juego real resulta
+    ser temporal ahi tambien, el lazo cerrado lo corrige: la reja reaparece
+    como `closed_gate` en la siguiente re-percepcion y se re-planifica.
     """
-    if not world.gates:
-        return world.gates
-    gate = world.button_gate.get(button)
-    if gate is None or gate not in world.gates:
-        gate = min(
-            world.gates,
-            key=lambda g: (abs(g[0] - button[0]) + abs(g[1] - button[1]), g),
+    all_gates = world.all_gates or world.gates
+    return len(all_gates) == 1 and len(world.buttons) == 1
+
+
+def _gates_actuales(world: World, covered: FrozenSet[Cell]) -> FrozenSet[Cell]:
+    """
+    Rejas cerradas tras cubrir/descubrir botones.
+
+    - Temporal: ABRE solo las rejas cuyo boton esta cubierto ahora y
+      cierra las demas (vuelven a `gates` desde `all_gates`). El
+      emparejamiento es 1:1 (`button_gate`); sin emparejamiento (fixtures
+      sin `button_gate`) se usa la reja mas cercana.
+    - Permanente (varios pares): cada boton recien cubierto abre su reja
+      y nunca mas se cierra (se sigue la semantica historica acumulativa).
+    """
+    all_gates = world.all_gates | world.gates
+    if not all_gates:
+        return frozenset()
+    temporal = _es_temporal(world)
+    distance = lambda a, b: abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    def reja_del(button: Cell) -> Cell:
+        # Emparejamiento 1:1; sin el (fixtures sin `button_gate`), la
+        # reja mas cercana entre las que todavia estan cerradas.
+        gate = world.button_gate.get(button)
+        if gate is not None and gate in all_gates:
+            return gate
+        candidatas = (all_gates if temporal else world.gates) or all_gates
+        return min(
+            candidatas,
+            key=lambda g: (distance(button, g), g),
         )
-    return frozenset(world.gates - {gate})
+
+    if temporal:
+        # Derivado: abierta solo si SU boton esta cubierto ahora.
+        abiertas = frozenset(reja_del(b) for b in covered)
+        return frozenset(all_gates - abiertas)
+    # Permanente (varios pares): solo se abren, nunca se recierran. Ya
+    # abiertas siguen abiertas; cada boton cubierto abre la suya.
+    abiertas = frozenset(all_gates - world.gates)
+    abiertas |= frozenset(reja_del(b) for b in covered)
+    return frozenset(all_gates - abiertas)
 
 
 def _collect(world: World) -> World:
@@ -494,17 +588,18 @@ def _collect(world: World) -> World:
     if player in keys and not has_key:
         keys = keys - {player}
         has_key = True
-    # Un boton es una placa de presion: se activa si lo pisa el personaje
-    # o si queda una roca encima. Cada boton recien activado abre la reja
-    # mas cercana (la percepcion no dice que reja abre cual boton).
+    # Un boton es una placa de presion: esta cubierto si lo pisa el
+    # personaje o si queda una roca encima. Se recalcula CADA paso (no
+    # solo los "nuevos"): con un solo par boton-reja la reja se cierra
+    # al descubrir el boton. En modo permanente (varios pares) `pressed`
+    # sigue siendo acumulativo.
     covered = world.buttons & (world.rocks | {player})
-    new_pressed = covered - world.pressed
-    gates = world.gates
-    pressed = world.pressed
-    if new_pressed:
-        pressed = frozenset(world.pressed | new_pressed)
-        for button in sorted(new_pressed):
-            gates = _open_nearest_gate(replace(world, gates=gates), button)
+    all_gates = world.all_gates | world.gates
+    gates = _gates_actuales(world, covered)
+    if _es_temporal(world):
+        pressed = covered
+    else:
+        pressed = frozenset(world.pressed | covered)
     exit_unlocked = world.exit_unlocked or (
         world.exit is not None and not diamonds
     )
@@ -516,6 +611,7 @@ def _collect(world: World) -> World:
         and has_key == world.has_key
         and pressed == world.pressed
         and gates == world.gates
+        and all_gates == world.all_gates
         and exit_unlocked == world.exit_unlocked
     ):
         return world
@@ -527,14 +623,24 @@ def _collect(world: World) -> World:
         has_key=has_key,
         pressed=pressed,
         gates=frozenset(gates),
+        all_gates=frozenset(all_gates),
         exit_unlocked=exit_unlocked,
     )
 
 
-def _successors(world: World):
+def _successors(
+    world: World,
+    allow_spike_activation: bool = True,
+    allow_rock_on_diamond: bool = True,
+):
     """Todos los (action, new_world) validos desde `world`."""
     for direction in PLAYER_ORDER:
-        result = _step(world, direction)
+        result = _step(
+            world,
+            direction,
+            allow_spike_activation=allow_spike_activation,
+            allow_rock_on_diamond=allow_rock_on_diamond,
+        )
         if result is None:
             continue
         action, new = result
@@ -621,7 +727,9 @@ def _reached(world: World, goals: FrozenSet[Cell]) -> bool:
     return world.player in goals or bool(goals & world.pressed)
 
 
-def _successes_for(name: str, goals: FrozenSet[Cell]) -> List[Callable[[World], bool]]:
+def _successes_for(
+    name: str, goals: FrozenSet[Cell], world: World
+) -> List[Callable[[World], bool]]:
     """
     Predicados de exito de un subobjetivo, en orden de preferencia.
 
@@ -629,8 +737,14 @@ def _successes_for(name: str, goals: FrozenSet[Cell]) -> List[Callable[[World], 
     taparlos pero nunca recogerlos, asi que el unico exito posible es
     que el personaje este encima. Para llaves solo vale la DESAPARICION:
     como el personaje lleva una sola, pisar la celda de otra llave no la
-    recoge, asi que "pisar" daria un falso positivo. Botones y salida
-    requieren al personaje encima (o el boton activado).
+    recoge, asi que "pisar" daria un falso positivo. Puertas: tambien la
+    desaparicion (abrirlas al pisarlas con la llave).
+
+    Botones: en modo PERMANENTE basta con el personaje encima o con el
+    boton ya activado (una roca tambien lo activa). En modo TEMPORAL la
+    reja se cierra al soltar el boton, asi que solo una ROCA encima deja
+    la reja abierta de forma util (pisar y salir no sirve para cruzar la
+    propia reja); el personaje encima queda como ultimo recurso.
     """
     if name.startswith("diamante"):
         return [lambda world: world.player in goals]
@@ -639,29 +753,48 @@ def _successes_for(name: str, goals: FrozenSet[Cell]) -> List[Callable[[World], 
     if name.startswith("hoyo"):
         # Un hoyo esta "resuelto" cuando se rellena (desaparece de la capa).
         return [lambda world: not (goals & world.holes)]
+    if name.startswith("puerta"):
+        # Una puerta se "resuelve" al abrirla: pisarla con la llave la
+        # quita de `doors` (y consume la llave). Vale la desaparicion,
+        # igual que las llaves, por si el plan se mueve tras abrirla.
+        return [lambda world: not (goals & world.doors)]
+    if name.startswith("boton") and _es_temporal(world):
+        return [
+            lambda world: bool(goals & world.rocks),
+            lambda world: world.player in goals,
+        ]
     return [lambda world: _reached(world, goals)]
 
 
-def _bare_path(world: World, target: Cell) -> Optional[List[Cell]]:
+def _path_avoiding(
+    world: World,
+    source: Cell,
+    target: Cell,
+    avoid: FrozenSet[Cell] = frozenset(),
+) -> Optional[List[Cell]]:
     """
-    Camino mas corto del personaje a `target` sobre la topologia "pelada"
-    (ignora rocas y bloqueos dinamicos, igual que la heuristica). Se usa
-    para descubrir que hoyos cortan el paso a una meta. Devuelve la lista
-    de celdas desde el personaje (inclusive) hasta la meta, o None.
+    Camino mas corto de `source` a `target` sobre la topologia "pelada"
+    (ignora rocas y bloqueos dinamicos, igual que la heuristica) sin
+    atravesar las celdas de `avoid`. Devuelve la lista de celdas desde
+    `source` (inclusive) hasta `target`, o None si no hay camino.
     """
-    prev: Dict[Cell, Optional[Cell]] = {world.player: None}
-    queue = deque([world.player])
+    if source == target:
+        return [source]
+    prev: Dict[Cell, Optional[Cell]] = {source: None}
+    queue = deque([source])
     while queue:
         cell = queue.popleft()
-        if cell == target:
-            break
         for neighbor in _neighbors(world, cell):
             if (
                 world.in_bounds(neighbor)
                 and neighbor not in world.walls
+                and neighbor not in avoid
                 and neighbor not in prev
             ):
                 prev[neighbor] = cell
+                if neighbor == target:
+                    queue.clear()
+                    break
                 queue.append(neighbor)
     if target not in prev:
         return None
@@ -674,12 +807,113 @@ def _bare_path(world: World, target: Cell) -> Optional[List[Cell]]:
     return path
 
 
+def _bare_path(world: World, target: Cell) -> Optional[List[Cell]]:
+    """
+    Camino mas corto del personaje a `target` sobre la topologia "pelada"
+    (ignora rocas y bloqueos dinamicos, igual que la heuristica). Se usa
+    para descubrir que hoyos cortan el paso a una meta. Devuelve la lista
+    de celdas desde el personaje (inclusive) hasta la meta, o None.
+    """
+    return _path_avoiding(world, world.player, target)
+
+
+def _dedup(cells: Iterable[Cell]) -> List[Cell]:
+    """Celdas sin repetir, conservando el orden."""
+    seen: List[Cell] = []
+    for cell in cells:
+        if cell not in seen:
+            seen.append(cell)
+    return seen
+
+
+def holes_blocking(world: World, target: Cell, back: bool = True) -> List[Cell]:
+    """
+    Hoyos que hay que rellenar antes de ir a `target` y poder volver
+    (sin repetir). Analisis conjunto IDA/VUELTA sobre la topologia
+    pelada:
+
+    - IDA: primero se busca un camino que evite hoyos Y picos (lo
+      ideal). Si existe, la vuelta es su inverso y no hay nada que
+      rellenar. Si no, se admite cruzar picos y se registra `cruce`
+      (los picos de esa ida); si ni siquiera hay camino ignorando los
+      picos, los hoyos del camino pelado son bloqueadores reales.
+    - VUELTA: un pico cruzado queda como muro para siempre, asi que el
+      retorno puede quedar cortado. Se prueban dos niveles: sin pisar
+      hoyos ni los picos del `cruce` (si existe, el hoyo no importa);
+      y solo evitando el `cruce` (picos frescos valen, se cruzan en un
+      solo sentido). En el segundo nivel el retorno depende de un hoyo:
+      hay que rellenarlo ANTES de cruzar ningun pico. Es el caso del
+      nivel 6: la ida al bolsillo norte cruza (10,7)/(12,8) y la
+      vuelta pasa por (11,1).
+
+    `back=False` (salida) salta el analisis de vuelta: el plan termina
+    en `target` y no hay que regresar.
+    """
+    if not world.holes:
+        return []
+    ideal = _path_avoiding(
+        world, world.player, target, avoid=world.holes | world.spikes
+    )
+    if ideal is not None:
+        return []
+    ida = _path_avoiding(world, world.player, target, avoid=world.holes)
+    if ida is None:
+        out = _bare_path(world, target)
+        found = [c for c in out if c in world.holes] if out else []
+        return _dedup(found)
+    cruce = frozenset(c for c in ida if c in world.spikes)
+    if not back:
+        return []
+    # `cruce` es un subconjunto de los picos, asi que esta vuelta es mas
+    # restrictiva que la inversa de `ideal` (ya descartada arriba).
+    if (
+        _path_avoiding(world, target, world.player, avoid=world.holes | cruce)
+        is not None
+    ):
+        return []
+    libre = _path_avoiding(world, target, world.player, avoid=cruce)
+    if libre is None:
+        return []
+    return _dedup([c for c in libre if c in world.holes])
+
+
+def _puerta_bloqueante(
+    world: World, target: Cell, failed: Set[FrozenSet[Cell]]
+) -> Optional[Cell]:
+    """
+    Puerta con llave disponible que hay que abrir para que algo llegue a
+    `target` (uso: un hoyo cuyo relleno exige cruzar una puerta, p. ej.
+    nivel 6: la roca hacia (11,1) pasa por la puerta (10,2)). Es
+    candidata si alguna ruta pelada (del personaje o de una roca) hacia
+    `target` la atraviesa y no fallo antes. Devuelve la mas cercana a
+    `target` (la que hay que cruzar antes), o None.
+    """
+    caminos: List[List[Cell]] = []
+    player_path = _path_avoiding(world, world.player, target)
+    if player_path:
+        caminos.append(player_path)
+    for rock in sorted(world.rocks):
+        rock_path = _path_avoiding(world, rock, target)
+        if rock_path:
+            caminos.append(rock_path)
+    candidatas = {
+        cell for path in caminos for cell in path if cell in world.doors
+    }
+    candidatas = {d for d in candidatas if frozenset({d}) not in failed}
+    if not candidatas:
+        return None
+    field = wall_distance_field(world, {target})
+    return min(candidatas, key=lambda d: field.get(d, float("inf")))
+
+
 def a_star(
     world: World,
     goals: FrozenSet[Cell],
     max_nodes: int = config.MAX_NODES_ASTAR,
     weight: float = config.A_STAR_WEIGHT,
     success: Optional[Callable[[World], bool]] = None,
+    allow_spike_activation: bool = True,
+    allow_rock_on_diamond: bool = True,
 ) -> Optional[Tuple[List[Action], World]]:
     """
     A* ponderado sobre el espacio de mundos completos. Devuelve
@@ -689,6 +923,9 @@ def a_star(
     puzzles Sokoban de los niveles finales. Mueve, empuja rocas, rellena
     hoyos y alcanza la meta. `success` permite definir cuando el
     subobjetivo esta logrado (por defecto, pisar la meta).
+    Con `allow_spike_activation=False` no activa picos; con
+    `allow_rock_on_diamond=False` no deja rocas sobre diamantes
+    (ver `_step`).
     """
     reached = success or (lambda w: _reached(w, goals))
     if reached(world):
@@ -715,7 +952,11 @@ def a_star(
         if reached(current):
             return list(plan), current
 
-        for action, successor in _successors(current):
+        for action, successor in _successors(
+            current,
+            allow_spike_activation=allow_spike_activation,
+            allow_rock_on_diamond=allow_rock_on_diamond,
+        ):
             state_key = _state_key(successor)
             if state_key in visited:
                 continue
@@ -740,11 +981,16 @@ def backtracking_search(
     max_nodes: int = config.MAX_NODES_BACKTRACK,
     max_depth: int = config.MAX_DEPTH,
     success: Optional[Callable[[World], bool]] = None,
+    allow_spike_activation: bool = True,
+    allow_rock_on_diamond: bool = True,
 ) -> Optional[Tuple[List[Action], World]]:
     """
     DFS con backtracking sobre el espacio de mundos. Prioriza las
     acciones que empujan rocas (para desbloquear corredores) y se
     deshace de ramas sin salida con `visited` + tope de profundidad.
+    Con `allow_spike_activation=False` no activa picos; con
+    `allow_rock_on_diamond=False` no deja rocas sobre diamantes
+    (ver `_step`).
     """
     reached = success or (lambda w: _reached(w, goals))
     if reached(world):
@@ -767,7 +1013,14 @@ def backtracking_search(
             return list(plan), current
 
         # Empujes primero: es lo que desbloquea el camino bloqueado.
-        successors = sorted(_successors(current), key=lambda s: s[0].kind != "push")
+        successors = sorted(
+            _successors(
+                current,
+                allow_spike_activation=allow_spike_activation,
+                allow_rock_on_diamond=allow_rock_on_diamond,
+            ),
+            key=lambda s: s[0].kind != "push",
+        )
         for action, successor in reversed(successors):
             if _state_key(successor) in visited:
                 continue
@@ -779,29 +1032,156 @@ def backtracking_search(
 # ---------------------------------------------------------------
 # Planificador de alto nivel (subobjetivos)
 # ---------------------------------------------------------------
+def _es_profunda(world: World, cell: Cell) -> bool:
+    """
+    True si la ida a `cell` exige cruzar un pico: no hay camino que
+    evite hoyos Y picos, pero si uno que solo evite hoyos. Tales metas
+    quedan "dentro" del bolsillo tras el cruce (los picos actuan en un
+    solo sentido), asi que _goals_of las pospone para barrerlas en una
+    sola ida. Solo aplica con hoyos en el mundo: sin ellos no hay nada
+    que rellenar antes y el orden clasico ya funciona.
+    """
+    if not world.holes:
+        return False
+    if _path_avoiding(
+        world, world.player, cell, avoid=world.holes | world.spikes
+    ) is not None:
+        return False
+    return _path_avoiding(world, world.player, cell, avoid=world.holes) is not None
+
+
+def _reja_bloquea(world: World, button: Cell) -> bool:
+    """
+    True si la reja de `button` corta el camino pelado del personaje a
+    algun diamante o a la salida pendientes.
+
+    Con rejas temporales solo interesa empujar una roca a los botones
+    cuya reja estorba; los botones decorativos no generan subobjetivo
+    (evita perseguir rocas hacia placas inutiles). Sin emparejamiento
+    conocido se devuelve True (conservador: no se descarta la meta).
+    """
+    gate = world.button_gate.get(button)
+    if gate is None:
+        return True
+    metas = set(world.diamonds)
+    if world.exit is not None:
+        metas.add(world.exit)
+    for target in metas:
+        path = _path_avoiding(
+            world, world.player, target, avoid=world.holes | world.spikes
+        )
+        if path is not None and gate in path:
+            return True
+    return False
+
+
 def _goals_of(world: World):
     """
     Secuencia de subobjetivos segun el contenido del nivel. Solo la usa
     el respaldo _plan_fallback (la busqueda global no los necesita):
 
-    1) llaves (abren las puertas, que pueden tapar el resto);
-    2) botones (abren las rejas, que pueden tapar el resto);
-    3) cada diamante, uno por uno;
-    4) la salida, SOLO cuando ya no quedan diamantes.
+    1) llaves seguras (no exigen cruzar picos);
+    2) pre-fase: los hoyos que bloquean la ida o la vuelta de las
+       metas profundas (ver holes_blocking). Van aqui, con la llave
+       recien cogida y antes de que ningun A* consuma la llave en otra
+       puerta: nivel 6 rellena (11,1) antes de cualquier diamante;
+    3) botones (abren las rejas);
+    4) diamantes seguros, uno por uno;
+    5) llaves profundas y 6) diamantes profundos: el bolsillo que se
+       alcanza cruzando picos se barre en una sola ida, tras lo seguro,
+       para no gastar los picos de entrada/salida a medias;
+    7) la salida, SOLO cuando ya no quedan diamantes.
 
-    Cada subobjetivo es individual: si uno queda inalcanzable se marca
-    pendiente sin perder la planificacion del resto.
+    Los hoyos que cortan la IDA o la VUELTA a un objetivo se emiten
+    PROACTIVAMENTE justo antes de ese objetivo (el relleno de Sokoban
+    va antes que lo que depende de el). Cada subobjetivo es individual:
+    si uno queda inalcanzable se marca pendiente sin perder la
+    planificacion del resto. Los hoyos repetidos entre metas se
+    deduplican con `seen_holes`.
     """
-    for cell in sorted(world.keys):
+    seen_holes: Set[Cell] = set()
+
+    def holes_for(cell: Cell):
+        """Hoyos que cortan la ida o el retorno a `cell` (sin repetir)."""
+        for hole in holes_blocking(world, cell):
+            if hole not in seen_holes:
+                seen_holes.add(hole)
+                yield f"hoyo {hole}", frozenset({hole})
+
+    llaves = sorted(world.keys)
+    diamantes = sorted(world.diamonds)
+    llaves_p = [c for c in llaves if _es_profunda(world, c)]
+    diam_p = [c for c in diamantes if _es_profunda(world, c)]
+
+    for cell in (c for c in llaves if c not in llaves_p):
+        yield from holes_for(cell)
         yield f"llave {cell}", frozenset({cell})
+    for cell in llaves_p + diam_p:
+        yield from holes_for(cell)
     for cell in sorted(world.buttons):
         if cell in world.pressed:
             continue
+        # Con reja temporal la reja solo se abre mientras la placa este
+        # cubierta: solo vale la pena perseguir botones cuya reja corta
+        # el paso a una meta pendiente.
+        if _es_temporal(world) and not _reja_bloquea(world, cell):
+            continue
         yield f"boton {cell}", frozenset({cell})
-    for cell in sorted(world.diamonds):
+    for cell in (c for c in diamantes if c not in diam_p):
+        yield from holes_for(cell)
+        yield f"diamante {cell}", frozenset({cell})
+    for cell in llaves_p:
+        yield from holes_for(cell)
+        yield f"llave {cell}", frozenset({cell})
+    for cell in diam_p:
+        yield from holes_for(cell)
         yield f"diamante {cell}", frozenset({cell})
     if world.exit is not None and world.exit_unlocked:
         yield "salida", frozenset({world.exit})
+
+
+def _reachable_avoiding_holes(world: World, target: Cell) -> bool:
+    """True si `target` es alcanzable sin pisar ningun hoyo."""
+    visited: Set[Cell] = {world.player}
+    queue = deque([world.player])
+    while queue:
+        cell = queue.popleft()
+        if cell == target:
+            return True
+        for neighbor in _neighbors(world, cell):
+            if (
+                world.in_bounds(neighbor)
+                and neighbor not in world.walls
+                and neighbor not in world.holes
+                and neighbor not in visited
+            ):
+                visited.add(neighbor)
+                queue.append(neighbor)
+    return target in visited
+
+
+def _is_solvable(world: World, goals: List[FrozenSet[Cell]]) -> bool:
+    """
+    Heuristica para abortar _plan_fallback cuando el mundo avanzo a un
+    estado ya insoluble (evita el bucle de re-cola de hoyos cuya roca
+    quedo inalcanzable). Devuelve False si alguna meta quedo sin
+    ninguna ruta posible:
+
+    - ninguna celda del goal es alcanzable en el grafo pelado, o
+    - todas las rutas al goal pasan por un hoyo y no quedan rocas
+      con las que rellenarlo.
+    """
+    for goal in goals:
+        if not goal:
+            continue
+        field = wall_distance_field(world, goal)
+        if not any(cell in field for cell in goal):
+            return False
+        if world.holes and not world.rocks:
+            target = next(iter(goal))
+            if not _reachable_avoiding_holes(world, target):
+                return False
+    return True
 
 
 @dataclass
@@ -883,6 +1263,12 @@ class Planner:
         # presupuesto o no hay camino, cae en la busqueda con retroceso.
         # Tras cada etapa se recalculan las metas sobre el mundo avanzado
         # (diamantes recolectados se van quitando de la lista).
+        #
+        # El A* miope de un subobjetivo puede tomar decisiones
+        # irreversibles (activar un pico, dejar una roca sobre un
+        # diamante) sin ver las consecuencias para el resto del nivel.
+        # Por eso se intenta PRIMERO con destructive=False y solo se
+        # recurre a movimientos irreversibles como ultimo recurso.
         actions: List[Action] = []
         # El mundo del planificador arranca tras recolectar lo que el
         # personaje ya pisa (y desbloqueando la salida si no hay gemas).
@@ -891,6 +1277,7 @@ class Planner:
         # mientras el mundo no avance.
         failed: Set[FrozenSet[Cell]] = set()
         pending: List[str] = []
+        global_retries = 0
 
         def mark_pending(name: str) -> None:
             if name not in pending:
@@ -902,26 +1289,57 @@ class Planner:
             return deque(
                 (name, goals)
                 for name, goals in _goals_of(current)
-                if not any(s(current) for s in _successes_for(name, goals))
+                if not any(s(current) for s in _successes_for(name, goals, current))
                 and goals not in failed
             )
 
-        def resolve(name: str, goals: FrozenSet[Cell], astar_budget: int):
+        def resolve(
+            name: str,
+            goals: FrozenSet[Cell],
+            astar_budget: int,
+            solo_seguro: bool = False,
+        ):
             # Prueba los predicados de exito en orden: primero "pisar la
             # meta", luego "el objeto desaparecio". Para cada uno intenta
-            # A* y, si no hay camino, el retroceso.
-            for success in _successes_for(name, goals):
-                result = a_star(current, goals, astar_budget, success=success)
-                if result is None:
-                    result = backtracking_search(
+            # A* y, si no hay camino, el retroceso. Tres pasadas:
+            #   1) sin activar picos ni rocas sobre diamantes (seguro);
+            #   2) activando picos si hace falta (el pico es la unica
+            #      via) pero sin rocas sobre diamantes;
+            #   3) todo permitido (ultimo recurso).
+            # Con `solo_seguro=True` (hay hoyos abiertos que cortan la
+            # ida/vuelta a la meta) se queda en la pasada 1: activar un
+            # pico antes de rellenar esos hoyos dejaria el retorno
+            # cortado (nivel 6: subir a la fila 13 sin rellenar (11,1)).
+            modes = (
+                ((False, False),) if solo_seguro else
+                (
+                    (False, False),
+                    (True, False),
+                    (True, True),
+                )
+            )
+            for spikes, rocks in modes:
+                for success in _successes_for(name, goals, current):
+                    result = a_star(
                         current,
                         goals,
-                        self.max_nodes_backtrack,
-                        self.max_depth,
+                        astar_budget,
                         success=success,
+                        allow_spike_activation=spikes,
+                        allow_rock_on_diamond=rocks,
                     )
-                if result is not None:
-                    return result
+                    if result is None:
+                        result = backtracking_search(
+                            current,
+                            goals,
+                            self.max_nodes_backtrack,
+                            self.max_depth,
+                            success=success,
+                            allow_spike_activation=spikes,
+                            allow_rock_on_diamond=rocks,
+                        )
+                    if result is not None:
+                        return result
             return None
 
         queue = enqueue()
@@ -931,28 +1349,56 @@ class Planner:
             # nodo de piso alcanzable jamas se puede resolver, asi que
             # se marca pendiente sin gastar presupuesto de busqueda.
             if current.nodes and not goals <= current.nodes:
+                print(f"[trace] PRUNE {name} (fuera del grafo)")
                 mark_pending(name)
                 failed.add(frozenset(goals))
                 continue
-            # Hoyos abiertos que cortan el camino "pelado" a esta meta
-            # (macro de Sokoban: habra que rellenarlos). Si los hay, se
-            # intenta resolver con presupuesto pequeno y, si falla, se
+            # Hoyos abiertos que cortan la ida o la vuelta a esta meta
+            # (macro de Sokoban: hay que rellenarlos ANTES; ver
+            # holes_blocking). Si los hay, la meta se resuelve con
+            # presupuesto de hoyo y SOLO en modo seguro, y si falla se
             # expande en subobjetivos de relleno.
             target = next(iter(goals), None)
-            path = (
-                _bare_path(current, target)
-                if target is not None
-                and current.holes
-                and not name.startswith("hoyo")
-                else None
-            )
-            blockers = [c for c in path if c in current.holes] if path else []
+            es_hoyo = name.startswith("hoyo")
+            es_puerta = name.startswith("puerta")
+            # Recuperacion ANTES de gastar presupuesto: un hoyo sin
+            # rellenar cuya ruta (del personaje o de una roca) cruza una
+            # puerta con llave (nivel 6: la roca hacia (11,1) pasa por
+            # la puerta (10,2)). Abrirla primero despeja el A* de
+            # relleno sin quemar los tres modos de resolve. Al abrirla
+            # se consume la llave (o la puerta fallida entra en
+            # `failed`), asi que no se vuelve a emitir: el bucle termina.
+            if (
+                es_hoyo
+                and target is not None
+                and current.has_key
+                and current.doors
+            ):
+                puerta = _puerta_bloqueante(current, target, failed)
+                if puerta is not None:
+                    queue.appendleft((name, goals))
+                    queue.appendleft(
+                        (f"puerta {puerta}", frozenset({puerta}))
+                    )
+                    continue
+            blockers: List[Cell] = []
+            if target is not None and current.holes and not (es_hoyo or es_puerta):
+                blockers = holes_blocking(
+                    current, target, back=not name.startswith("salida")
+                )
             budget = (
                 config.MAX_NODES_HOLE
-                if (blockers or name.startswith("hoyo"))
+                if (blockers or es_hoyo)
                 else self.max_nodes_astar
             )
-            result = resolve(name, goals, budget)
+            previous = current
+            result = resolve(name, goals, budget, solo_seguro=bool(blockers))
+            print(
+                f"[trace] pop={name} blockers={blockers} budget={budget} "
+                f"seguro={bool(blockers)} player={current.player} "
+                f"has_key={current.has_key} doors={sorted(current.doors)} "
+                f"-> {'OK ' + str(len(result[0])) if result else 'FALLA'}"
+            )
             if result is None:
                 new_blockers = [
                     h for h in blockers if frozenset({h}) not in failed
@@ -971,10 +1417,70 @@ class Planner:
             actions.extend(steps)
             if name in pending:
                 pending.remove(name)
-            # El mundo avanzo de forma monotona (se recolecto algo, se
-            # abrio una reja...): reintentar lo que antes habia fallado.
-            failed.clear()
+            # Reintentar lo fallido solo si el mundo avanzo de verdad
+            # (pasos nuevos o cambio de estado). Con rejas temporales un
+            # boton puede "resolverse" sin dejar progreso persistente (el
+            # personaje lo pisa y lo suelta al ir a la meta siguiente):
+            # limpiar `failed` sin progreso real re-encolaria la misma
+            # pareja de metas en un ciclo infinito.
+            if steps or current != previous:
+                failed.clear()
+            else:
+                failed.add(frozenset(goals))
             queue = enqueue()
+            # Reintento global tras progreso (puerta abierta o llave
+            # recogida): el espacio de busqueda se ha reducido y el A*
+            # global puede caber ahora en el presupuesto. El objetivo
+            # incluye la salida si ya esta desbloqueada, para no quedar
+            # atrapado en una region tras recolectar todo.
+            if (
+                global_retries < 2
+                and current.diamonds
+                and (
+                    len(current.doors) < len(world.doors)
+                    or len(current.keys) < len(world.keys)
+                )
+            ):
+                global_retries += 1
+                exit_cell = current.exit
+                if exit_cell is not None and current.exit_unlocked:
+                    goals_global = frozenset(
+                        current.diamonds | {exit_cell}
+                    )
+                else:
+                    goals_global = frozenset(current.diamonds)
+
+                def _global_done(w: World) -> bool:
+                    if w.diamonds:
+                        return False
+                    if w.exit is None:
+                        return True
+                    return w.player == w.exit or (
+                        not w.exit_unlocked and not w.diamonds
+                    )
+
+                result = a_star(
+                    current,
+                    goals_global,
+                    self.max_nodes_astar,
+                    success=_global_done,
+                )
+                if result is not None:
+                    steps, current = result
+                    actions.extend(steps)
+                    pending = []
+                    break
+            # Si alguna meta pendiente quedo sin ninguna ruta posible,
+            # abortar (evita el bucle de re-cola de hoyos cuya roca
+            # quedo inalcanzable).
+            remaining = [g for _, g in _goals_of(current) if g not in failed]
+            if remaining and not _is_solvable(current, remaining):
+                for name_r, goals_r in _goals_of(current):
+                    if goals_r not in failed and not any(
+                        s(current) for s in _successes_for(name_r, goals_r, current)
+                    ):
+                        mark_pending(name_r)
+                break
 
         return Plan(
             actions=actions,

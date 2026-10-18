@@ -445,8 +445,13 @@ def test_no_destruye_diamante_sin_salida():
     assert not final.diamonds
 
 
-def test_boton_abre_reja():
-    """Un boton en el camino abre la reja que bloquea el diamante."""
+def test_reja_temporal_sin_roca_no_es_solucionable():
+    """
+    Con un solo par boton-reja la reja se cierra al soltar el boton: si el
+    diamante esta detras y no hay roca para dejarla pisada, el nivel no
+    tiene solucion. El plan queda incompleto (el agente no se "cuela" por
+    la reja pisando el boton).
+    """
     world = World(
         rows=3,
         cols=5,
@@ -458,15 +463,44 @@ def test_boton_abre_reja():
     )
     plan = Planner().plan(world)
 
-    assert plan.complete
-    assert plan.final_world.player == (1, 4)
-    assert not plan.final_world.gates  # reja abierta
-    assert simulate(world, plan.actions).player == (1, 4)
+    assert not plan.complete
+    assert plan.final_world.diamonds == frozenset({(1, 4)})
+
+
+def test_reja_temporal_se_cierra_al_salir_del_boton():
+    """
+    Modelo temporal 1:1: pisar el boton abre la reja; el movimiento
+    siguiente la vuelve a cerrar. No se puede atravesar la propia reja sin
+    una roca que mantenga la placa pisada.
+    """
+    world = World(
+        rows=3,
+        cols=5,
+        player=(1, 0),
+        buttons=frozenset({(1, 1)}),
+        gates=frozenset({(1, 2)}),
+        walls=_corredor([0, 2]),
+    )
+    # Pisar el boton abre la reja.
+    _paso, sobre_boton = _step(world, "right")
+    sobre_boton = _collect(sobre_boton)
+    assert sobre_boton.player == (1, 1)
+    assert not sobre_boton.gates
+    # Colarse a la casilla de la reja es invalido: al salir del boton la
+    # reja se cerraria con el personaje dentro.
+    assert _step(sobre_boton, "right") is None
+    # Alrededor: salir del boton la vuelve a cerrar.
+    _paso2, salido = _step(sobre_boton, "left")
+    assert _collect(salido).gates == frozenset({(1, 2)})
 
 
 def test_roca_sobre_boton_abre_reja():
-    """Un boton es placa de presion: una roca encima tambien lo activa."""
-    muros = _corredor([0, 3], cols=6) | {(1, 0), (2, 0)}
+    """
+    Un boton es placa de presion: una roca encima la mantiene pisada y, con
+    reja temporal, la deja abierta de forma permanente. El diamante solo es
+    alcanzable cruzando la reja (la fila 2 esta cerrada al final).
+    """
+    muros = _corredor([0, 3], cols=6) | {(1, 0), (2, 0), (2, 4), (2, 5)}
     world = World(
         rows=4,
         cols=6,
@@ -482,6 +516,56 @@ def test_roca_sobre_boton_abre_reja():
     assert plan.complete
     assert not plan.final_world.gates
     assert (2, 3) in plan.final_world.pressed
+    assert simulate(world, plan.actions).player == (1, 5)
+
+
+def test_varios_pares_mantiene_apertura_permanente():
+    """
+    Con mas de un par boton-reja se conserva la semantica historica: el
+    boton abre su reja para siempre (el cierre temporal multi-par queda
+    pendiente de definir). Aqui solo hace falta el primer par para llegar
+    al diamante; el segundo permanece cerrado.
+    """
+    world = World(
+        rows=3,
+        cols=7,
+        player=(1, 0),
+        buttons=frozenset({(1, 1), (1, 5)}),
+        gates=frozenset({(1, 2), (1, 6)}),
+        diamonds=frozenset({(1, 4)}),
+        walls=_corredor([0, 2], cols=7),
+    )
+    plan = Planner().plan(world)
+    final = plan.final_world
+
+    assert plan.complete
+    assert final.player == (1, 4)
+    assert final.gates == frozenset({(1, 6)})   # la reja usada sigue abierta
+    assert (1, 1) in final.pressed              # monótono: no se desactiva
+    assert simulate(world, plan.actions).player == (1, 4)
+
+
+def test_fallback_temporal_termina_y_completa():
+    """
+    Con reja temporal el subobjetivo "boton" puede resolverse sin progreso
+    persistente (pisar y soltar).     Forzando el respaldo con presupuesto de
+    A* diminuto, el fallback debe terminar (sin re-encolar en ciclo) y, con
+    roca disponible, completar el nivel.
+    """
+    muros = _corredor([0, 3], cols=6) | {(1, 0), (2, 0), (2, 4), (2, 5)}
+    world = World(
+        rows=4,
+        cols=6,
+        player=(1, 1),
+        rocks=frozenset({(2, 2)}),
+        buttons=frozenset({(2, 3)}),
+        gates=frozenset({(1, 4)}),
+        diamonds=frozenset({(1, 5)}),
+        walls=muros,
+    )
+    plan = Planner(max_nodes_astar=1).plan(world)
+
+    assert plan.complete
     assert simulate(world, plan.actions).player == (1, 5)
 
 
@@ -593,3 +677,137 @@ def test_a_star_devuelve_camino_optimo():
     assert result is not None
     actions, _final = result
     assert len(actions) == 8  # Manhattan exacta (4+4)
+
+
+# ---------------------------------------------------------------
+# Nivel 6 (fixture manual): huecos, picos de un solo sentido y
+# la secuencia llave -> puerta -> hoyo -> barrido del bolsillo norte.
+# ---------------------------------------------------------------
+def _nivel6() -> World:
+    """
+    Nivel 6 capturado de assets/levels/level6.png, como World manual
+    (no depende de la percepcion). La grilla derivada de `walls`
+    reproduce exactamente el grafo de la percepcion (adyacencia y
+    nodos), asi que basta con los muros y las capas de objetos.
+    """
+    ceros = {(r, c) for r in (0, 1, 2, 14) for c in range(10)}
+    bordes = {(r, c) for r in range(15) for c in (0, 9)}
+    internos = {
+        (5, 2), (5, 4), (5, 5), (5, 7),
+        (8, 3), (8, 4), (8, 6),
+        (9, 3), (9, 6),
+        (10, 1), (10, 3), (10, 4), (10, 5), (10, 6), (10, 8),
+        (12, 2), (12, 3), (12, 4), (12, 5), (12, 6), (12, 7),
+    }
+    walls = frozenset(ceros | bordes | internos)
+    piso = frozenset(
+        (r, c)
+        for r in range(15)
+        for c in range(10)
+        if (r, c) not in walls
+    )
+    return World(
+        rows=15,
+        cols=10,
+        player=(3, 5),
+        walls=walls,
+        spikes=frozenset({(10, 7), (12, 8), (13, 1)}),
+        rocks=frozenset({(4, 2), (4, 7)}),
+        diamonds=frozenset(
+            {
+                (4, 4), (4, 5), (9, 2), (9, 5), (9, 8),
+                (11, 3), (11, 4), (11, 5), (13, 3), (13, 5),
+            }
+        ),
+        holes=frozenset({(5, 1), (5, 8), (11, 1)}),
+        doors=frozenset({(8, 5), (10, 2)}),
+        keys=frozenset({(4, 8), (13, 4)}),
+        exit=(9, 4),
+        exit_unlocked=False,
+        nodes=piso,
+    )
+
+
+@pytest.fixture(scope="module")
+def plan_nivel6():
+    """Plan del nivel 6 calculado una sola vez (cuesta ~80 s)."""
+    world = _nivel6()
+    return world, Planner().plan(world)
+
+
+def test_nivel6_plan_completo(plan_nivel6):
+    """
+    El fallback del nivel 6 compone: llave (4,8) -> puerta (10,2) ->
+    hoyo (11,1) -> diamantes -> salida. Antes de corregir el orden,
+    la llave (13,4) sellaba el bolsillo norte y el plan quedaba
+    incompleto (32 pasos y jugador atrapado en (13,3)).
+    """
+    world, plan = plan_nivel6
+
+    assert plan.complete, plan.pending
+    assert not plan.pending
+    final = simulate(world, plan.actions)
+    assert final.player == (9, 4)
+    assert not final.diamonds
+    assert not final.holes <= world.holes  # al menos (11,1) rellenado
+    assert (11, 1) not in final.holes
+    assert final == plan.final_world
+
+
+def test_nivel6_roca_no_tapa_diamante(plan_nivel6):
+    """
+    En ningun momento del plan queda una roca sobre un diamante sin
+    recolectar (taparlo lo volveria intratable: las rocas no
+    recolectan diamantes).
+    """
+    world, plan = plan_nivel6
+    actual = world
+    for action in plan.actions:
+        resultado = _step(actual, action.direction)
+        assert resultado is not None, f"paso invalido: {action}"
+        _accion, actual = resultado
+        actual = _collect(actual)
+        assert not (actual.rocks & actual.diamonds), (
+            f"roca sobre diamante tras {action}: "
+            f"{sorted(actual.rocks & actual.diamonds)}"
+        )
+    assert not actual.diamonds
+
+
+def test_fallback_no_bucle_hoyo():
+    """
+    El nivel 6 emite UN solo subobjetivo de hoyo, (11,1): ni (5,1) ni
+    (5,8) (se desperdiciarian las rocas y (5,8) mata el nivel), y va
+    tras la llave (4,8) y antes de cualquier diamante y de las metas
+    profundas del bolsillo norte. Un orden distinto re-encolaria hoyos
+    o dejaria metas intratables.
+    """
+    nombres = [name for name, _ in _goals_of(_nivel6())]
+
+    assert [n for n in nombres if n.startswith("hoyo")] == ["hoyo (11, 1)"]
+    assert nombres.index("llave (4, 8)") < nombres.index("hoyo (11, 1)")
+    assert nombres.index("hoyo (11, 1)") < nombres.index("diamante (4, 4)")
+    assert nombres.index("diamante (4, 4)") < nombres.index("diamante (13, 3)")
+    assert nombres.index("llave (13, 4)") < nombres.index("diamante (13, 3)")
+    assert "salida" not in nombres  # bloqueada hasta juntar diamantes
+
+
+def test_destructive_false_no_activa_picos(plan_nivel6):
+    """
+    Mientras (11,1) siga abierto no se activa NI UN pico (los picos
+    activados pasan a `walls`): cruzarlos antes rellenar el hueco
+    sellaria el bolsillo norte con diamantes dentro.
+    """
+    world, plan = plan_nivel6
+    assert (11, 1) in world.holes
+    actual = world
+    for action in plan.actions:
+        resultado = _step(actual, action.direction)
+        assert resultado is not None, f"paso invalido: {action}"
+        _accion, actual = resultado
+        actual = _collect(actual)
+        if (11, 1) in actual.holes:
+            assert actual.spikes == world.spikes, (
+                f"pico activado con (11,1) abierto tras {action}"
+            )
+    assert (11, 1) not in actual.holes  # el hueco se relleno al final

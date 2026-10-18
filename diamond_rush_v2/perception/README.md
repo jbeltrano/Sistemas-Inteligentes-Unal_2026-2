@@ -184,7 +184,7 @@ Los nombres válidos son los de `config.TEMPLATE_NAMES`. **El grafo no codifica 
 | `rock_in_hole` | Hoyo ya rellenado (ahora transitable) |
 | `lava` | Peligro mortal |
 | `spike` / `no_spike` | Pinchos activos / pinchos retraídos (estados del mismo objeto) |
-| `button` | Se pisa para activar algo (`?`) |
+| `button` | Placa de presión: mantiene abierta su reja mientras el personaje o una roca la cubra (emparejamiento 1:1) |
 | `closed_gate` / `open_gate` | Reja cerrada / abierta (estados del mismo objeto) |
 | `scape_block` / `scape_enable` | Bloque de escape y su estado activado (`?`) |
 | `totem` | Estatua (`?`) |
@@ -257,3 +257,4 @@ El grafo da la **topología** (qué celdas existen y qué conecta con qué) y `o
 6. **Foto de un frame.** Tras cada acción que cambie el tablero (empujar roca, abrir puerta, recoger llave) hay que volver a percibir, o simular el cambio en el planificador.
 7. **Diamante tapado por una roca.** Una roca empujada sobre un diamante lo tapa sin recolectarlo (solo el jugador recolecta al pisar la celda), pero el sprite de la roca oculta el del diamante: en una re-verificación intermedia `recognize` ya no lo detecta y el planificador cree que no quedan gemas, desbloqueando la salida antes de tiempo. En el peor caso el lazo de control lo detecta como desvío y se queda re-planificando hasta agotar `MAX_REPLANS`.
 8. **Picos dinámicos.** Un pico retraído (`no_spike`) se activa **permanentemente** cuando el personaje sale de la celda: una sola cruzada por celda. El modelo lo simula en `World.spikes` (`computation/compute.py`): al salir de la celda esta pasa a `walls` y el planificador nunca vuelve a cruzarla. Tras la activación, una re-percepción la debería ver como `spike` activo (muro) y confirmar el modelo; si el sprite no matchea, el plan sigue siendo válido porque el modelo ya asumió el corte.
+9. **Rejas temporales (un solo par botón-reja).** El emparejamiento botón→reja es siempre 1:1 y la percepción no dice cuál botón abre cuál reja: se infiere por cercanía (`_match_buttons_to_gates`). Con **un solo par** la reja es **temporal**: está abierta solo mientras el personaje o una roca cubra el botón (para atravesarla hay que dejar una roca encima; pisar y salir la vuelve a cerrar). `World.all_gates` recuerda todas las rejas para poder recerrarlas y `World.gates` guarda solo las cerradas ahora mismo. Con **varios pares** se conserva de momento la apertura **permanente** al pisar el botón (comportamiento pendiente de definir). Si el juego real difiere, el lazo cerrado lo corrige: la reja reaparece como `closed_gate` en la re-percepción y se re-planifica.

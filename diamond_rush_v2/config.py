@@ -65,8 +65,10 @@ MAX_DEPTH = 900                # tope de profundidad del retroceso
 # es mas fuerte (encuentra plan antes, a cambio de no ser optimo). Ayuda
 # en los puzzles tipo Sokoban de los niveles finales.
 A_STAR_WEIGHT = 2.0
-# Presupuesto de A* para subobjetivos de relleno de hoyo (locales).
-MAX_NODES_HOLE = 60_000
+# Presupuesto de A* para subobjetivos de relleno de hoyo (locales). El
+# nivel 6 exige ~200k nodos para rellenar (11,1) con la puerta abierta,
+# asi que 60k no alcanzaba ni con la mecanica resuelta.
+MAX_NODES_HOLE = 250_000
 
 # ---------------------------------------------------------------
 # Control (teclado vía Selenium)
@@ -81,7 +83,7 @@ PRESS_SECONDS = 0.08           # cuánto se mantiene la flecha presionada (el ju
 #   N >= 1 -> verificar cada N pasos y re-planificar si hay desvío (1 = cada paso)
 #   0      -> no verificar durante la ejecución (solo el chequeo final)
 VERIFY_EVERY = 10
-MAX_REPLANS = 50               # tope de re-planificaciones seguidas antes de abortar
+MAX_REPLANS = 100              # tope de re-planificaciones seguidas antes de abortar
 # Asentado tras cada paso: se re-percibe hasta que la celda del personaje
 # deje de cambiar, para no leer un frame a mitad de la animación y creer
 # que hubo desvío (lo que reenviaría la misma flecha = doble movimiento).
