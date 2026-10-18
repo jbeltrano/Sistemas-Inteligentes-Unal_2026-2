@@ -52,6 +52,7 @@ from typing import (
     Tuple,
 )
 
+import button_gate
 import config
 from perception.state import GameState
 
@@ -93,17 +94,17 @@ class World:
     - `diamonds`: diamantes por recolectar.
     - `holes`: hoyos abiertos (bloquean salvo que se empuje una roca
       dentro; al rellenarse el hoyo pasa a piso transitable).
-    - `gates`: rejas CERRADAS en este instante (bloquean el paso). Con
-      un solo par boton-reja la apertura es TEMPORAL: al descubrir el
-      boton la reja vuelve a entrar en esta capa (ver `_gates_actuales`).
+    - `gates`: rejas CERRADAS en este instante (bloquean el paso). La
+      apertura es TEMPORAL: la reja se abre solo mientras su boton este
+      cubierto y vuelve a entrar en esta capa al descubrirlo (ver
+      `_gates_actuales`).
     - `all_gates`: todas las rejas del nivel, abiertas o cerradas
       (constante durante las transiciones; hace de memoria para poder
       recerrar una reja temporal).
     - `buttons`: botones (piso; placas de presion que abren una reja).
     - `pressed`: botones cubiertos (por el personaje o por una roca).
-      En modo temporal es derivado de la cobertura actual (NO es
-      monotonico: al descubrir el boton se vacia); en modo permanente
-      (varios pares) si lo es: una reja abierta no se vuelve a cerrar.
+      Es derivado de la cobertura actual: NO es monotonico (al descubrir
+      el boton se vacia y su reja se cierra).
     - `doors`: puertas con cerradura (bloquean hasta tener una llave).
     - `keys`: llaves sueltas por recoger.
     - `has_key`: el personaje lleva una llave (habilita `doors`). Lleva
@@ -137,12 +138,12 @@ class World:
     # se auto-sana en _collect (all_gates | gates) para fixtures de test.
     all_gates: FrozenSet[Cell] = frozenset()
     buttons: FrozenSet[Cell] = frozenset()
-    # Botones cubiertos (personaje o roca encima). En modo temporal es
-    # derivado y NO monotono (una reja abierta se cierra al soltar el
-    # boton); en modo permanente (varios pares) es monotono.
+    # Botones cubiertos (personaje o roca encima). Derivado y NO monotono
+    # (una reja abierta se cierra al soltar su boton).
     pressed: FrozenSet[Cell] = frozenset()
-    # Emparejamiento boton -> reja que abre (la percepcion no lo dice; se
-    # infiere por cercania global, 1:1).
+    # Emparejamiento boton -> reja que abre (la percepcion no lo dice). Se
+    # declara por nivel en button_gate.py; lo no declarado se infiere por
+    # cercania global, 1:1.
     button_gate: Dict[Cell, Cell] = field(default_factory=dict)
     doors: FrozenSet[Cell] = frozenset()
     keys: FrozenSet[Cell] = frozenset()
@@ -208,7 +209,11 @@ _ROLE_TO_WORLD = {
 }
 
 
-def world_from_state(state: GameState, roles: Optional[Dict[str, str]] = None) -> World:
+def world_from_state(
+    state: GameState,
+    roles: Optional[Dict[str, str]] = None,
+    level: Optional[int] = None,
+) -> World:
     """
     Traduce el GameState percibido (grid + detecciones) al World de
     busqueda. Los peligros estaticos (picos activos) se tratan como
@@ -216,6 +221,10 @@ def world_from_state(state: GameState, roles: Optional[Dict[str, str]] = None) -
     que el planificador simule su activacion; los estados dinamicos
     (hoyos, rejas, puertas, salida) se guardan como capas propias para
     que el planificador los simule.
+
+    `level` (1..20) habilita el mapeo explicito boton->reja de
+    button_gate.py; sin el se empareja por cercania (ver
+    _button_gate_map).
     """
     roles = roles or ROLES
     grid = state.grid.tolist()
@@ -273,7 +282,7 @@ def world_from_state(state: GameState, roles: Optional[Dict[str, str]] = None) -
         gates=frozenset(gates),
         all_gates=frozenset(gates),
         buttons=frozenset(buttons),
-        button_gate=_match_buttons_to_gates(buttons, gates),
+        button_gate=_button_gate_map(level, buttons, gates),
         doors=frozenset(doors),
         keys=frozenset(keys),
         # Capacidad 1 + consumo: como el nivel tiene igual numero de
@@ -287,6 +296,29 @@ def world_from_state(state: GameState, roles: Optional[Dict[str, str]] = None) -
         nodes=frozenset(state.graph_nodes),
         adjacency=state.adjacency,
     )
+
+
+def _button_gate_map(
+    level: Optional[int], buttons: Set[Cell], gates: Set[Cell]
+) -> Dict[Cell, Cell]:
+    """
+    Emparejamiento boton->reja 1:1.
+
+    Si `level` trae un mapeo explicito en button_gate.py, se usan las
+    entradas cuyas DOS celdas existan en lo percibido; el resto de
+    botones/rejas se completa por cercania. Sin `level` (o sin entrada
+    para ese nivel) todo se resuelve por cercania. La validacion de
+    celdas evita aplicar un mapeo si el nivel percibido no coincide con
+    el declarado.
+    """
+    explicito = (
+        button_gate.BUTTON_GATE.get(level, {}) if level is not None else {}
+    )
+    mapping = {b: g for b, g in explicito.items() if b in buttons and g in gates}
+    pendientes_b = buttons - set(mapping)
+    pendientes_g = gates - set(mapping.values())
+    mapping.update(_match_buttons_to_gates(pendientes_b, pendientes_g))
+    return mapping
 
 
 def _match_buttons_to_gates(
@@ -512,56 +544,38 @@ def _step(
 
 def _es_temporal(world: World) -> bool:
     """
-    True cuando la apertura de la reja es TEMPORAL (hay que mantener el
-    boton cubierto: personaje o roca encima, para que la reja no se
-    cierre). Ocurre con un UNICO par boton-reja.
-
-    Con varios pares se conserva el comportamiento permanente actual
-    (pisar el boton abre su reja para siempre); si el juego real resulta
-    ser temporal ahi tambien, el lazo cerrado lo corrige: la reja reaparece
-    como `closed_gate` en la siguiente re-percepcion y se re-planifica.
+    True cuando la apertura de la reja es TEMPORAL: hay que mantener el
+    boton cubierto (personaje o roca encima) para que la reja no se
+    cierre. Vale para CUALQUIER numero de pares boton-reja (el
+    emparejamiento es 1:1 via `button_gate`). No hay rejas sin boton.
     """
-    all_gates = world.all_gates or world.gates
-    return len(all_gates) == 1 and len(world.buttons) == 1
+    return bool(world.buttons) and bool(world.all_gates or world.gates)
 
 
 def _gates_actuales(world: World, covered: FrozenSet[Cell]) -> FrozenSet[Cell]:
     """
     Rejas cerradas tras cubrir/descubrir botones.
 
-    - Temporal: ABRE solo las rejas cuyo boton esta cubierto ahora y
-      cierra las demas (vuelven a `gates` desde `all_gates`). El
-      emparejamiento es 1:1 (`button_gate`); sin emparejamiento (fixtures
-      sin `button_gate`) se usa la reja mas cercana.
-    - Permanente (varios pares): cada boton recien cubierto abre su reja
-      y nunca mas se cierra (se sigue la semantica historica acumulativa).
+    Cada reja esta ABIERTA solo mientras SU boton esta cubierto ahora
+    (personaje o roca encima) y se cierra al descubrirlo. El
+    emparejamiento es 1:1 (`button_gate`); sin el (fixtures sin
+    `button_gate`) se usa la reja mas cercana. La semantica es temporal
+    para todos los pares.
     """
     all_gates = world.all_gates | world.gates
     if not all_gates:
         return frozenset()
-    temporal = _es_temporal(world)
     distance = lambda a, b: abs(a[0] - b[0]) + abs(a[1] - b[1])
 
     def reja_del(button: Cell) -> Cell:
         # Emparejamiento 1:1; sin el (fixtures sin `button_gate`), la
-        # reja mas cercana entre las que todavia estan cerradas.
+        # reja mas cercana.
         gate = world.button_gate.get(button)
         if gate is not None and gate in all_gates:
             return gate
-        candidatas = (all_gates if temporal else world.gates) or all_gates
-        return min(
-            candidatas,
-            key=lambda g: (distance(button, g), g),
-        )
+        return min(all_gates, key=lambda g: (distance(button, g), g))
 
-    if temporal:
-        # Derivado: abierta solo si SU boton esta cubierto ahora.
-        abiertas = frozenset(reja_del(b) for b in covered)
-        return frozenset(all_gates - abiertas)
-    # Permanente (varios pares): solo se abren, nunca se recierran. Ya
-    # abiertas siguen abiertas; cada boton cubierto abre la suya.
-    abiertas = frozenset(all_gates - world.gates)
-    abiertas |= frozenset(reja_del(b) for b in covered)
+    abiertas = frozenset(reja_del(b) for b in covered)
     return frozenset(all_gates - abiertas)
 
 
@@ -590,16 +604,12 @@ def _collect(world: World) -> World:
         has_key = True
     # Un boton es una placa de presion: esta cubierto si lo pisa el
     # personaje o si queda una roca encima. Se recalcula CADA paso (no
-    # solo los "nuevos"): con un solo par boton-reja la reja se cierra
-    # al descubrir el boton. En modo permanente (varios pares) `pressed`
-    # sigue siendo acumulativo.
+    # solo los "nuevos") porque la reja es temporal: se cierra al
+    # descubrir su boton.
     covered = world.buttons & (world.rocks | {player})
     all_gates = world.all_gates | world.gates
     gates = _gates_actuales(world, covered)
-    if _es_temporal(world):
-        pressed = covered
-    else:
-        pressed = frozenset(world.pressed | covered)
+    pressed = covered
     exit_unlocked = world.exit_unlocked or (
         world.exit is not None and not diamonds
     )
@@ -740,11 +750,10 @@ def _successes_for(
     recoge, asi que "pisar" daria un falso positivo. Puertas: tambien la
     desaparicion (abrirlas al pisarlas con la llave).
 
-    Botones: en modo PERMANENTE basta con el personaje encima o con el
-    boton ya activado (una roca tambien lo activa). En modo TEMPORAL la
-    reja se cierra al soltar el boton, asi que solo una ROCA encima deja
-    la reja abierta de forma util (pisar y salir no sirve para cruzar la
-    propia reja); el personaje encima queda como ultimo recurso.
+    Botones: la reja es TEMPORAL (se cierra al soltar el boton), asi que
+    solo una ROCA encima deja la reja abierta de forma util (pisar y
+    salir no sirve para cruzar la propia reja); el personaje encima
+    queda como ultimo recurso.
     """
     if name.startswith("diamante"):
         return [lambda world: world.player in goals]

@@ -8,10 +8,12 @@ Además, el pruning de metas fuera del grafo y la integración con
 `world_from_state` / `recognize`.
 """
 from collections import defaultdict
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
+import button_gate
 from computation.compute import (
     Planner,
     World,
@@ -519,12 +521,36 @@ def test_roca_sobre_boton_abre_reja():
     assert simulate(world, plan.actions).player == (1, 5)
 
 
-def test_varios_pares_mantiene_apertura_permanente():
+def test_varios_pares_temporal_derivado_y_no_monotono():
     """
-    Con mas de un par boton-reja se conserva la semantica historica: el
-    boton abre su reja para siempre (el cierre temporal multi-par queda
-    pendiente de definir). Aqui solo hace falta el primer par para llegar
-    al diamante; el segundo permanece cerrado.
+    Con varios pares la semantica tambien es temporal y el emparejamiento
+    es 1:1: `_collect` deriva las rejas de la cobertura actual. Con las
+    dos rocas encima de sus botones, ambas rejas quedan abiertas; al
+    retirar una roca SOLO su reja se cierra (no es monotono).
+    """
+    world = World(
+        rows=3,
+        cols=7,
+        player=(1, 0),
+        rocks=frozenset({(1, 1), (1, 5)}),
+        buttons=frozenset({(1, 1), (1, 5)}),
+        gates=frozenset({(1, 2), (1, 6)}),
+        walls=_corredor([0, 2], cols=7),
+    )
+    ambas = _collect(world)
+    assert ambas.pressed == frozenset({(1, 1), (1, 5)})
+    assert not ambas.gates
+
+    una = _collect(replace(world, rocks=frozenset({(1, 1)})))
+    assert una.pressed == frozenset({(1, 1)})
+    assert una.gates == frozenset({(1, 6)})   # se cierra la del boton descubierto
+    assert (1, 2) not in una.gates
+
+
+def test_varios_pares_temporal_sin_rocas_no_es_solucionable():
+    """
+    Con varios pares y sin rocas no se puede mantener ninguna reja
+    abierta al cruzar: el diamante tras la primera reja es inalcanzable.
     """
     world = World(
         rows=3,
@@ -536,13 +562,118 @@ def test_varios_pares_mantiene_apertura_permanente():
         walls=_corredor([0, 2], cols=7),
     )
     plan = Planner().plan(world)
-    final = plan.final_world
+
+    assert not plan.complete
+    assert (1, 6) in plan.final_world.gates
+    assert plan.final_world.player != (1, 4)
+
+
+def test_planifica_dos_pares_temporales_con_dos_rocas():
+    """
+    Dos pares temporales independientes: cada diamante esta detras de su
+    reja y solo se abre dejando una roca en el boton correspondiente. El
+    personaje no basta (cubre un boton a la vez y al moverse lo suelta).
+    """
+    muros = _corredor([0, 6], cols=6) | {(r, 0) for r in range(1, 6)}
+    muros |= {
+        (2, 4), (2, 5),          # paredes tras el boton de arriba
+        (3, 2), (3, 3), (3, 4), (3, 5),  # fila 3: solo el pasillo (3, 1)
+        (5, 4), (5, 5),          # paredes tras el boton de abajo
+    }
+    world = World(
+        rows=7,
+        cols=6,
+        player=(1, 1),
+        rocks=frozenset({(2, 2), (5, 2)}),
+        buttons=frozenset({(2, 3), (5, 3)}),
+        gates=frozenset({(1, 4), (4, 4)}),
+        diamonds=frozenset({(1, 5), (4, 5)}),
+        walls=frozenset(muros),
+    )
+    plan = Planner().plan(world)
 
     assert plan.complete
-    assert final.player == (1, 4)
-    assert final.gates == frozenset({(1, 6)})   # la reja usada sigue abierta
-    assert (1, 1) in final.pressed              # monótono: no se desactiva
-    assert simulate(world, plan.actions).player == (1, 4)
+    final = plan.final_world
+    assert not final.diamonds
+    assert not final.gates
+    assert final.pressed == frozenset({(2, 3), (5, 3)})
+    simulado = simulate(world, plan.actions)
+    assert simulado.pressed == frozenset({(2, 3), (5, 3)})
+    assert simulado.player in {(1, 5), (4, 5)}
+
+
+def test_world_from_state_usa_mapeo_explicito(monkeypatch):
+    """
+    Con `level`, el mapeo declarado en button_gate.py sobreescribe la
+    heuristica por cercania. Aqui el mapeo explicito cruza los pares que
+    la cercania emparejaria al reves.
+    """
+    grid = np.ones((1, 6), dtype=np.uint8)
+    # tile_size=1 y origen 0 => celda == (y, x) del centro.
+    objetos = [
+        DetectedObject("button", 2, 0, 1, 1),  # celda (0, 2)
+        DetectedObject("button", 5, 0, 1, 1),  # celda (0, 5)
+        DetectedObject("closed_gate", 4, 0, 1, 1),    # celda (0, 4)
+        DetectedObject("closed_gate", 1, 0, 1, 1),    # celda (0, 1)
+    ]
+    state = GameState(
+        grid=grid,
+        graph_nodes=set(),
+        adjacency={},
+        player_cell=(0, 0),
+        objects=objetos,
+        objects_by_cell={},
+        origin_x=0,
+        origin_y=0,
+        tile_size=1,
+    )
+
+    # Sin `level` el emparejamiento es por cercania.
+    por_cercania = world_from_state(state)
+    assert por_cercania.button_gate == {(0, 2): (0, 1), (0, 5): (0, 4)}
+
+    # Con `level` manda la tabla explicita (pares cruzados).
+    explicito = {(0, 2): (0, 4), (0, 5): (0, 1)}
+    monkeypatch.setitem(button_gate.BUTTON_GATE, 99, explicito)
+    con_nivel = world_from_state(state, level=99)
+    assert con_nivel.button_gate == explicito
+
+
+def test_world_from_state_ignora_mapeo_con_celdas_ausentes(monkeypatch):
+    """
+    Si el mapeo explicito menciona celdas que no se perciben, esas
+    entradas se ignoran y lo demas se completa por cercania (evita
+    aplicar un mapeo de otro nivel).
+    """
+    grid = np.ones((1, 6), dtype=np.uint8)
+    objetos = [
+        DetectedObject("button", 2, 0, 1, 1),  # celda (0, 2)
+        DetectedObject("button", 5, 0, 1, 1),  # celda (0, 5)
+        DetectedObject("closed_gate", 4, 0, 1, 1),    # celda (0, 4)
+        DetectedObject("closed_gate", 1, 0, 1, 1),    # celda (0, 1)
+    ]
+    state = GameState(
+        grid=grid,
+        graph_nodes=set(),
+        adjacency={},
+        player_cell=(0, 0),
+        objects=objetos,
+        objects_by_cell={},
+        origin_x=0,
+        origin_y=0,
+        tile_size=1,
+    )
+
+    # (0, 2)->(0, 4) es valido; (0, 0)->(0, 5) menciona un boton ausente.
+    monkeypatch.setitem(
+        button_gate.BUTTON_GATE, 98, {(0, 2): (0, 4), (0, 0): (0, 5)}
+    )
+    world = world_from_state(state, level=98)
+
+    assert world.button_gate[(0, 2)] == (0, 4)
+    # El boton restante (0, 5) toma la reja sobrante (0, 1).
+    assert world.button_gate[(0, 5)] == (0, 1)
+    assert (0, 0) not in world.button_gate
 
 
 def test_fallback_temporal_termina_y_completa():

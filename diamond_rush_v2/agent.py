@@ -38,6 +38,7 @@ class Agent:
         planner: Optional[Planner] = None,
         verify_every: int = config.VERIFY_EVERY,
         print_state: bool = False,
+        level: Optional[int] = None,
     ):
         # `keyboard` es opcional y SOLO se usa al ejecutar. El plan se
         # calcula con la unica captura; no se vuelve a mirar la pantalla
@@ -47,6 +48,9 @@ class Agent:
         self.planner = planner or Planner()
         self.verify_every = verify_every
         self.print_state = print_state
+        # Nivel actual (1..20) para el mapeo explicito boton->reja de
+        # button_gate.py; None = heuristica por cercania.
+        self.level = level
 
         self.state: Optional[GameState] = None
         self.world: Optional[World] = None
@@ -83,7 +87,7 @@ class Agent:
         """
         if self.state is None:
             self.perceive()
-        self.world = world_from_state(self.state)
+        self.world = world_from_state(self.state, level=self.level)
         self.plan = self.planner.plan(self.world)
         return self.plan
 
@@ -151,7 +155,7 @@ class Agent:
             if replans > config.MAX_REPLANS:
                 print("Demasiadas re-planificaciones seguidas; se aborta.")
                 break
-            self.world = world_from_state(state)
+            self.world = world_from_state(state, level=self.level)
             plan = self.planner.plan(self.world)
             self.plan = plan
             index = 0
