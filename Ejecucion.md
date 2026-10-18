@@ -19,3 +19,14 @@ Este comando permite que el agente realice un pantallazo despues de cada movimie
 python main.py --verify-every 0
 
 python main.py --verify-every 1
+
+
+## Niveles con mas de un boton
+Ahora, para el caso donde los niveles tienen mas de un boton, hay que especificarle al agente el nivel (Esto es para que el agente, pueda leer un archivo interno con el mapeo de los botones y en base a eso arme el camino)
+
+Esto se puede lograr con la bandera --level N, donde N es el nivel en que se encuentra el agente
+
+Por ejemplo
+
+python main.py --verify-every 0 --level 8
+python main.py --level 8
