@@ -17,6 +17,7 @@ from computation.compute import (
     World,
     _collect,
     _goals_of,
+    _state_key,
     _step,
     a_star,
     simulate,
@@ -226,6 +227,92 @@ def test_recognize_y_plan_consistente():
 
 
 # ---------------------------------------------------------------
+# Picos dinamicos (una sola cruzada permanente por celda)
+# ---------------------------------------------------------------
+def test_pico_se_activa_al_salir():
+    """
+    Un pico retraido (`spikes`) se activa permanentemente cuando el
+    personaje SALE de la celda: pasa a ser muro y ya no se puede volver
+    a cruzar. Entrar a la celda no la activa. La clave de deduplicacion
+    distingue el mundo con el pico activado.
+    """
+    # Salir de un pico lo convierte en muro.
+    w = World(rows=3, cols=3, player=(1, 1), spikes=frozenset({(1, 1)}))
+    result = _step(w, "left")
+    assert result is not None
+    _action, salido = result
+    assert salido.player == (1, 0)
+    assert (1, 1) in salido.walls
+    assert (1, 1) not in salido.spikes
+    assert _step(salido, "right") is None  # el pico activado ya bloquea
+    assert _state_key(w) != _state_key(salido)
+
+    # Entrar a un pico NO lo activa; recien al salir de vuelta.
+    w2 = World(rows=3, cols=3, player=(1, 0), spikes=frozenset({(1, 1)}))
+    _a, entrado = _step(w2, "right")
+    assert entrado.player == (1, 1)
+    assert (1, 1) not in entrado.walls and (1, 1) in entrado.spikes
+    _b, salio = _step(entrado, "left")
+    assert (1, 1) in salio.walls
+    assert (1, 1) not in salio.spikes
+
+    # Empujar desde un pico tambien lo activa (el jugador sale de la celda).
+    w3 = World(
+        rows=3,
+        cols=5,
+        player=(1, 1),
+        spikes=frozenset({(1, 1)}),
+        rocks=frozenset({(1, 2)}),
+    )
+    _c, empujado = _step(w3, "right")
+    assert _c is not None
+    assert (1, 1) in empujado.walls
+
+
+def test_nivel5_picos_sin_recrucex():
+    """
+    Integracion nivel 5: los picos se activan al cruzarlos, asi que un
+    plan valido no puede visitar dos veces la misma celda de pico. El
+    planificador debe resolverlo completo sin recrucex.
+    """
+    cv2 = pytest.importorskip("cv2")
+    import config
+    from perception.recognition import recognize
+
+    path = config.LEVELS_DIR / "level5.png"
+    if not path.exists():
+        pytest.skip(f"no está {path}")
+
+    frame = cv2.imread(str(path))
+    try:
+        state = recognize(frame)
+    except RuntimeError as error:
+        pytest.skip(f"reconocimiento falló sobre {path.name}: {error}")
+
+    world = world_from_state(state)
+    plan = Planner().plan(world)
+
+    assert plan.complete
+    assert not plan.final_world.diamonds
+    assert plan.final_world.player == plan.final_world.exit
+
+    picos = {state.cell_of(o.center) for o in state.objects_named("no_spike")}
+    assert picos, "el nivel 5 debe tener picos retraidos detectados"
+    secuencia = [world.player]
+    actual = world
+    for action in plan.actions:
+        result = _step(actual, action.direction)
+        assert result is not None
+        actual = _collect(result[1])
+        secuencia.append(actual.player)
+    assert actual == plan.final_world
+    for pico in sorted(picos):
+        assert secuencia.count(pico) <= 1, (
+            f"el pico {pico} se visitó {secuencia.count(pico)} veces"
+        )
+
+
+# ---------------------------------------------------------------
 # Mecanicas del juego (hoyo+roca, boton/reja, llave/puerta, salida)
 # ---------------------------------------------------------------
 def test_hoyo_se_rellena_con_roca():
@@ -287,24 +374,20 @@ def test_roca_tapa_diamante_y_el_jugador_lo_recoge():
 
 def test_step_no_deja_roca_atrapada_sobre_diamante():
     """Tapa permanente de un diamante: prohibida. Tapa temporal: permitida."""
-    libs = {(1, 3), (2, 3), (3, 3), (4, 3)}
-    walls = frozenset(
-        (r, c) for r in range(5) for c in range(5) if (r, c) not in libs
-    )
+    def muros(piso):
+        return frozenset(
+            (r, c) for r in range(5) for c in range(5) if (r, c) not in piso
+        )
 
     # Muro mas alla del diamante: la roca quedaria atrapada encima.
     # (solo la columna del diamante es piso; (4,3) es muro)
-    muro_mas_alla = walls | {(4, 3)} - libs  # solo (4,3) extra respecto a libs
     world = World(
         rows=5,
         cols=5,
         player=(1, 3),
         rocks=frozenset({(2, 3)}),
         diamonds=frozenset({(3, 3)}),
-        walls=frozenset(
-            (r, c) for r in range(5) for c in range(5) if (r, c) not in libs
-        )
-        - {(4, 3)},
+        walls=muros({(1, 3), (2, 3), (3, 3)}),
     )
     assert _step(world, "down") is None
 
@@ -330,7 +413,7 @@ def test_step_no_deja_roca_atrapada_sobre_diamante():
         rocks=frozenset({(2, 3)}),
         diamonds=frozenset({(3, 3)}),
         holes=frozenset({(4, 3)}),
-        walls=walls,
+        walls=muros({(1, 3), (2, 3), (3, 3), (4, 3)}),
     )
     assert _step(con_hoyo, "down") is not None
 
@@ -423,10 +506,13 @@ def test_llave_abre_puerta():
     assert simulate(world, plan.actions).player == (1, 4)
 
 
-def test_no_lleva_dos_llaves_a_la_vez():
+def test_no_persigue_llaves_sueltas():
     """
-    Capacidad 1: con dos llaves y ninguna puerta, el personaje recoge
-    una y no puede recoger la segunda (la del piso queda intacta).
+    Sin diamantes ni salida que requieran la llave, el planificador no
+    persigue llaves sueltas (la busqueda global solo mete diamantes; las
+    llaves son instrumentales). La capacidad 1 de _collect sigue
+    existiendo: recoge una y al pisar otra con el inventario lleno la
+    deja en el piso.
     """
     world = World(
         rows=1,
@@ -436,12 +522,21 @@ def test_no_lleva_dos_llaves_a_la_vez():
     )
     plan = Planner().plan(world)
 
+    assert plan.complete            # nada que hacer: no se persiguen
+    assert plan.length == 0
     final = plan.final_world
-    assert final.has_key                      # se lleva una
-    assert final.keys == frozenset({(0, 2)})  # la otra quedo en el piso
-    # No hay forma de resolver la segunda llave: queda pendiente.
-    assert not plan.complete
-    assert "llave (0, 2)" in plan.pending
+    assert final.keys == frozenset({(0, 1), (0, 2)})
+    assert not final.has_key
+
+    # Capacidad 1 directo en _collect: una sola llave en el inventario.
+    cargada = _collect(World(rows=1, cols=5, player=(0, 1), keys=frozenset({(0, 1), (0, 2)})))
+    assert cargada.has_key
+    assert cargada.keys == frozenset({(0, 2)})
+    # Con el inventario lleno, pisar la segunda llave no la recoge.
+    _paso, movida = _step(cargada, "right")
+    recogida = _collect(movida)
+    assert recogida.has_key
+    assert recogida.keys == frozenset({(0, 2)})  # la del piso queda intacta
 
 
 def test_dos_puertas_requieren_dos_llaves():

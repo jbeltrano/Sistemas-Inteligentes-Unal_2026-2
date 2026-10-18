@@ -24,10 +24,14 @@ CONSISTENTE -> A* devuelve la solucion optima dentro de cada subobjetivo;
 y al ser distancias reales (no Manhattan) el agente ya "sabe" esquivar
 los muros del laberinto.
 
-La planificacion se compone en subobjetivos:
-  1) recolectar todos los diamantes restantes (una busqueda por cada uno)
-  2) si hay una llave sin recoger, recogerla antes de la salida
-  3) alcanzar la salida
+La planificacion ocurre en fases:
+  1) recoleccion GLOBAL: una sola busqueda con meta = todos los
+     diamantes (las llaves, puertas, rejas y botones quedan
+     instrumentales: el A* los usa solo si hacen falta);
+  2) alcanzar la salida (solo con 0 diamantes);
+  3) si la busqueda global se queda sin presupuesto, respaldo con la
+     composicion clasica de subobjetivos (_plan_fallback): llaves,
+     botones, diamantes uno por uno y salida.
 
 Este modulo importa SOLO de perception.state (el contrato) y config;
 nunca de cv2 ni de recognition.py.
@@ -82,6 +86,9 @@ class World:
     Todo son conjuntos de celdas (fila, columna):
 
     - `walls`: celdas fijas intransitables (pared, picos activos).
+    - `spikes`: picos RETRAIDOS (piso hasta ahora). Son dinamicos: en el
+      juego real se activan permanentemente cuando el personaje sale de la
+      celda; ver `_step`. Una vez activados pasan a `walls`.
     - `rocks`: celdas ocupadas por una roca empujable.
     - `diamonds`: diamantes por recolectar.
     - `holes`: hoyos abiertos (bloquean salvo que se empuje una roca
@@ -111,6 +118,7 @@ class World:
     cols: int
     player: Cell
     walls: FrozenSet[Cell] = frozenset()
+    spikes: FrozenSet[Cell] = frozenset()
     rocks: FrozenSet[Cell] = frozenset()
     diamonds: FrozenSet[Cell] = frozenset()
     holes: FrozenSet[Cell] = frozenset()
@@ -167,7 +175,7 @@ ROLES = {
     "closed_gate": "gate",
     "hole": "hole",
     "spike": "hazard",
-    "no_spike": "floor",
+    "no_spike": "retracted_spike",
     "button": "button",
     "player": "player",
 }
@@ -178,6 +186,7 @@ _ROLE_TO_WORLD = {
     "rock": ("rocks",),
     "fixed": ("walls",),
     "hazard": ("walls",),
+    "retracted_spike": ("spikes",),
     "hole": ("holes",),
     "gate": ("gates",),
     "button": ("buttons",),
@@ -188,9 +197,11 @@ _ROLE_TO_WORLD = {
 def world_from_state(state: GameState, roles: Optional[Dict[str, str]] = None) -> World:
     """
     Traduce el GameState percibido (grid + detecciones) al World de
-    busqueda. Los peligros estaticos (picos) se tratan como muros; los
-    estados dinamicos (hoyos, rejas, puertas, salida) se guardan como
-    capas propias para que el planificador los simule.
+    busqueda. Los peligros estaticos (picos activos) se tratan como
+    muros; los picos retraidos (`no_spike`) van a la capa `spikes` para
+    que el planificador simule su activacion; los estados dinamicos
+    (hoyos, rejas, puertas, salida) se guardan como capas propias para
+    que el planificador los simule.
     """
     roles = roles or ROLES
     grid = state.grid.tolist()
@@ -206,6 +217,7 @@ def world_from_state(state: GameState, roles: Optional[Dict[str, str]] = None) -
         walls -= set(state.graph_nodes)
     rocks: Set[Cell] = set()
     diamonds: Set[Cell] = set()
+    spikes: Set[Cell] = set()
     holes: Set[Cell] = set()
     gates: Set[Cell] = set()
     buttons: Set[Cell] = set()
@@ -224,6 +236,7 @@ def world_from_state(state: GameState, roles: Optional[Dict[str, str]] = None) -
                     "walls": walls,
                     "rocks": rocks,
                     "diamonds": diamonds,
+                    "spikes": spikes,
                     "holes": holes,
                     "gates": gates,
                     "buttons": buttons,
@@ -238,6 +251,7 @@ def world_from_state(state: GameState, roles: Optional[Dict[str, str]] = None) -
         rows=rows,
         cols=cols,
         walls=frozenset(walls),
+        spikes=frozenset(spikes),
         rocks=frozenset(rocks),
         player=state.player_cell,
         diamonds=frozenset(diamonds),
@@ -358,6 +372,21 @@ def _connected(world: World, origin: Cell, target: Cell) -> bool:
 # ---------------------------------------------------------------
 # Sucesores
 # ---------------------------------------------------------------
+def _leave_spike(world: World, origin: Cell) -> World:
+    """
+    Al SALIR de una celda de pico retraido, el pico se activa para
+    siempre: la celda pasa de `spikes` a `walls` (el camino queda cortado
+    en esa direccion). Activar solo se hace al salir, nunca al entrar.
+    """
+    if origin not in world.spikes:
+        return world
+    return replace(
+        world,
+        spikes=frozenset(world.spikes - {origin}),
+        walls=frozenset(world.walls | {origin}),
+    )
+
+
 def _step(world: World, direction: str) -> Optional[Tuple[Action, World]]:
     """
     Aplica un movimiento o un empuje desde el estado actual.
@@ -415,11 +444,13 @@ def _step(world: World, direction: str) -> Optional[Tuple[Action, World]]:
             rocks = frozenset(world.rocks - {target})
         else:
             rocks = frozenset((world.rocks - {target}) | {push})
-        return Action("push", direction), replace(
-            world, rocks=rocks, holes=holes, player=target
+        return Action("push", direction), _leave_spike(
+            replace(world, rocks=rocks, holes=holes, player=target), origin
         )
     else:
-        return Action("move", direction), replace(world, player=target)
+        return Action("move", direction), _leave_spike(
+            replace(world, player=target), origin
+        )
 
 
 def _open_nearest_gate(world: World, button: Cell) -> FrozenSet[Cell]:
@@ -570,6 +601,7 @@ def _state_key(world: World) -> tuple:
         world.player,
         world.rocks,
         world.diamonds,
+        world.spikes,
         world.keys,
         world.has_key,
         world.buttons,
@@ -749,7 +781,8 @@ def backtracking_search(
 # ---------------------------------------------------------------
 def _goals_of(world: World):
     """
-    Secuencia de subobjetivos segun el contenido del nivel:
+    Secuencia de subobjetivos segun el contenido del nivel. Solo la usa
+    el respaldo _plan_fallback (la busqueda global no los necesita):
 
     1) llaves (abren las puertas, que pueden tapar el resto);
     2) botones (abren las rejas, que pueden tapar el resto);
@@ -774,10 +807,19 @@ def _goals_of(world: World):
 @dataclass
 class Planner:
     """
-    Orquesta los subobjetivos. Para cada meta intenta A* y, si se queda
-    sin presupuesto o no hay camino, cae en la busqueda con retroceso.
-    Tras cada etapa se recalculan las metas sobre el mundo avanzado
-    (diamantes recolectados se van quitando de la lista).
+    Planifica en fases:
+
+    1) recoleccion GLOBAL: una sola busqueda con meta = todos los
+       diamantes. Elegir el orden de visita con vision de todo el nivel
+       evita decisiones irreversibles que destruyan metas posteriores
+       (cruzar un pico en mal orden, tapar el ultimo diamante con una
+       roca, etc.). Llaves, puertas, rejas y botones quedan
+       instrumentales: el A* los usa solo si hacen falta.
+    2) salida: una busqueda a la celda de la salida con 0 diamantes.
+    3) si la global se queda sin presupuesto, respaldo con la
+       composicion clasica de subobjetivos (_plan_fallback): llaves,
+       botones, diamantes uno por uno y salida, con A* y respaldo de
+       retroceso por meta.
 
     Devuelve un Plan (posiblemente incompleto si queda algo
     inalcanzable).
@@ -788,6 +830,59 @@ class Planner:
     max_depth: int = config.MAX_DEPTH
 
     def plan(self, world: World) -> Plan:
+        # El mundo del planificador arranca tras recolectar lo que el
+        # personaje ya pisa (y desbloqueando la salida si no hay gemas).
+        current = _collect(world)
+        actions: List[Action] = []
+        if current.diamonds:
+            result = a_star(
+                current,
+                frozenset(current.diamonds),
+                self.max_nodes_astar,
+                success=lambda w: not w.diamonds,
+            )
+            if result is None:
+                return self._plan_fallback(world)
+            steps, current = result
+            actions.extend(steps)
+        # La salida solo es meta con 0 diamantes (ya desbloqueada).
+        pending: List[str] = []
+        if current.exit is not None and not current.diamonds:
+            exit_cell = current.exit
+            goals = frozenset({exit_cell})
+            result = a_star(current, goals, self.max_nodes_astar)
+            if result is None:
+                # Mismo respaldo que el resolve del fallback: puzzles de
+                # salida con rocas necesitan el retroceso (p. ej. nivel 20).
+                result = backtracking_search(
+                    current,
+                    goals,
+                    self.max_nodes_backtrack,
+                    self.max_depth,
+                )
+            if result is None:
+                # Sin diamantes que recolectar, el fallback entero solo
+                # persigue la salida (incluye el macro de hoyos).
+                if not world.diamonds:
+                    return self._plan_fallback(world)
+                pending.append("salida")
+            else:
+                steps, current = result
+                actions.extend(steps)
+        return Plan(
+            actions=actions,
+            final_world=current,
+            complete=not pending,
+            pending=pending,
+            initial_world=world,
+        )
+
+    def _plan_fallback(self, world: World) -> Plan:
+        # Composicion clasica de subobjetivos (respaldo de la busqueda
+        # global). Para cada meta intenta A* y, si se queda sin
+        # presupuesto o no hay camino, cae en la busqueda con retroceso.
+        # Tras cada etapa se recalculan las metas sobre el mundo avanzado
+        # (diamantes recolectados se van quitando de la lista).
         actions: List[Action] = []
         # El mundo del planificador arranca tras recolectar lo que el
         # personaje ya pisa (y desbloqueando la salida si no hay gemas).
