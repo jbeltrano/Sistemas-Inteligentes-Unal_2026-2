@@ -14,13 +14,18 @@ import numpy as np
 import pytest
 
 import button_gate
+import level_hints
 from computation.compute import (
+    Action,
+    Plan,
     Planner,
     World,
     _collect,
+    _es_profunda,
     _goals_of,
     _state_key,
     _step,
+    _successes_for,
     a_star,
     simulate,
     world_from_state,
@@ -942,3 +947,337 @@ def test_destructive_false_no_activa_picos(plan_nivel6):
                 f"pico activado con (11,1) abierto tras {action}"
             )
     assert (11, 1) not in actual.holes  # el hueco se relleno al final
+
+
+# ---------------------------------------------------------------
+# Boton temporal instrumental: la roca precede al personaje.
+# ---------------------------------------------------------------
+def test_boton_temporal_no_acepta_personaje_sobre_boton():
+    """
+    Con reja temporal que tapa un diamante pendiente, "el personaje
+    encima del boton" NO es exito: al salir la reja se cierra. El
+    predicado de roca debe ir primero y el de personaje no ofrecerse
+    (era el falso exito que ciclaba el fallback del nivel 11).
+    """
+    world = World(
+        rows=3,
+        cols=5,
+        player=(1, 0),
+        buttons=frozenset({(1, 1)}),
+        all_gates=frozenset({(1, 2)}),
+        gates=frozenset({(1, 2)}),
+        button_gate={(1, 1): (1, 2)},
+        diamonds=frozenset({(1, 4)}),
+        walls=_corredor([0, 2]),
+    )
+    preds = _successes_for("boton (1, 1)", frozenset({(1, 1)}), world)
+    assert len(preds) == 1  # solo la roca encima vale como exito
+
+    sobre_el_boton = _collect(replace(world, player=(1, 1)))
+    assert not any(pred(sobre_el_boton) for pred in preds)
+
+    con_roca = _collect(replace(world, rocks=frozenset({(1, 1)})))
+    assert preds[0](con_roca)
+
+
+def test_boton_temporal_no_instrumental_acepta_personaje():
+    """
+    Si la reja NO corta el paso a ninguna meta pendiente, pisar el boton
+    sigue siendo un exito valido (no se pierde el ultimo recurso).
+    """
+    world = World(
+        rows=3,
+        cols=5,
+        player=(1, 0),
+        buttons=frozenset({(1, 1)}),
+        all_gates=frozenset({(1, 2)}),
+        gates=frozenset({(1, 2)}),
+        button_gate={(1, 1): (1, 2)},
+        walls=_corredor([0, 2]),
+    )
+    preds = _successes_for("boton (1, 1)", frozenset({(1, 1)}), world)
+    assert len(preds) == 2  # roca y, de ultimo, el personaje
+
+    sobre_el_boton = _collect(replace(world, player=(1, 1)))
+    assert any(pred(sobre_el_boton) for pred in preds)
+
+
+def test_es_profunda_sin_hoyos():
+    """
+    Un pico sigue siendo un cruce irreversible aunque el mundo no tenga
+    hoyos: la meta que solo se alcanza pisandolo queda "profunda" (antes
+    se devolvia False sin hoyos y se cruzaba el pico demasiado pronto).
+    """
+    walls = frozenset(
+        (r, c) for r in range(3) for c in range(3) if c != 0
+    )  # solo el pasillo de la columna 0
+    world = World(
+        rows=3,
+        cols=3,
+        player=(0, 0),
+        spikes=frozenset({(1, 0)}),
+        walls=walls,
+    )
+    assert not world.holes
+    assert _es_profunda(world, (2, 0)) is True
+
+
+# ---------------------------------------------------------------
+# Guarda del agente: no ejecutar planes incompletos.
+# ---------------------------------------------------------------
+def test_execute_no_envia_teclas_si_el_plan_es_incompleto():
+    """
+    Un plan incompleto no se ejecuta: no se manda ninguna flecha y se
+    devuelve el mismo plan (con las metas pendientes intactas).
+    """
+    import agent
+
+    class TecladoFalso:
+        def __init__(self):
+            self.llamadas = 0
+
+        def press(self, *args, **kwargs):  # pragma: no cover - no debe llamarse
+            self.llamadas += 1
+
+    teclado = TecladoFalso()
+    agente = agent.Agent(capturer=object(), keyboard=teclado, level=11)
+    plan = Plan(
+        actions=[Action("move", "right")],
+        complete=False,
+        pending=["diamante (4, 5)"],
+    )
+
+    resultado = agente.execute(plan)
+
+    assert resultado is plan
+    assert teclado.llamadas == 0
+
+
+# ---------------------------------------------------------------
+# Pistas de subobjetivos por nivel (level_hints.py)
+# ---------------------------------------------------------------
+def test_world_from_state_inyecta_hints(monkeypatch):
+    """
+    Con `level`, world_from_state traduce LEVEL_SEQUENCE a World.hints,
+    normaliza ("roca", origen, destino) segun el destino y descarta las
+    entradas cuyas celdas no existen en lo percibido (nivel a medias).
+    """
+    grid = np.ones((3, 3), dtype=np.uint8)
+    # tile_size=1 y origen 0 => celda == (y, x) del centro.
+    objetos = [
+        DetectedObject("rock", 0, 1, 1, 1),     # celda (1, 0)
+        DetectedObject("hole", 2, 1, 1, 1),     # celda (1, 2)
+        DetectedObject("diamond", 0, 2, 1, 1),  # celda (2, 0)
+    ]
+    state = GameState(
+        grid=grid,
+        graph_nodes=set(),
+        adjacency={},
+        player_cell=(0, 0),
+        objects=objetos,
+        objects_by_cell={},
+        origin_x=0,
+        origin_y=0,
+        tile_size=1,
+    )
+    monkeypatch.setitem(
+        level_hints.LEVEL_SEQUENCE,
+        77,
+        [
+            ("roca", (1, 0), (1, 2)),   # destino hoyo -> "hoyo (1, 2)"
+            ("diamante", (2, 0)),
+            ("llave", (9, 9)),           # ausente -> se ignora
+            ("roca", (1, 0), (9, 9)),    # destino fuera del tablero -> ignorado
+            ("hoyo", (9, 9)),            # ausente -> se ignora
+        ],
+    )
+    world = world_from_state(state, level=77)
+
+    assert world.hints == [
+        ("hoyo (1, 2)", frozenset({(1, 2)}), (1, 2)),
+        ("diamante (2, 0)", frozenset({(2, 0)}), None),
+    ]
+
+
+def test_hint_roca_a_boton_normaliza_y_guiar(monkeypatch):
+    """Un destino boton se normaliza como 'boton ...' con su rock_goal."""
+    grid = np.ones((3, 3), dtype=np.uint8)
+    objetos = [
+        DetectedObject("rock", 0, 1, 1, 1),      # celda (1, 0)
+        DetectedObject("button", 2, 1, 1, 1),    # celda (1, 2)
+    ]
+    state = GameState(
+        grid=grid,
+        graph_nodes=set(),
+        adjacency={},
+        player_cell=(0, 0),
+        objects=objetos,
+        objects_by_cell={},
+        origin_x=0,
+        origin_y=0,
+        tile_size=1,
+    )
+    monkeypatch.setitem(
+        level_hints.LEVEL_SEQUENCE, 80, [("roca", (1, 0), (1, 2))]
+    )
+    world = world_from_state(state, level=80)
+
+    assert world.hints == [
+        ("boton (1, 2)", frozenset({(1, 2)}), (1, 2)),
+    ]
+
+
+def test_hint_roca_descartada_si_destino_no_existe(monkeypatch):
+    """Un destino que no es hoyo, boton ni piso se descarta."""
+    grid = np.ones((3, 3), dtype=np.uint8)
+    grid[1][2] = 0  # muro
+    state = GameState(
+        grid=grid,
+        graph_nodes=set(),
+        adjacency={},
+        player_cell=(0, 0),
+        objects=[],
+        objects_by_cell={},
+        origin_x=0,
+        origin_y=0,
+        tile_size=1,
+    )
+    monkeypatch.setitem(
+        level_hints.LEVEL_SEQUENCE, 79, [("roca", (1, 0), (1, 2))]
+    )
+    world = world_from_state(state, level=79)
+
+    assert world.hints == []
+
+
+def test_hint_roca_en_hoyo_es_objetivo_principal():
+    """
+    La pista va primero en _goals_of (sin duplicar el hoyo que emite la
+    composicion automatica) y el plan completo la resuelve como su primer
+    A*: rellenar el hoyo empujando la roca, y luego los diamantes.
+    """
+    world = World(
+        rows=3,
+        cols=5,
+        player=(1, 0),
+        rocks=frozenset({(1, 1)}),
+        holes=frozenset({(1, 2)}),
+        diamonds=frozenset({(1, 4)}),
+        walls=_corredor([0, 2]),
+        hints=[("hoyo (1, 2)", frozenset({(1, 2)}), (1, 2))],
+    )
+    nombres = [name for name, _ in _goals_of(world)]
+    assert nombres[0] == "hoyo (1, 2)"        # la pista va primero
+    assert nombres.count("hoyo (1, 2)") == 1  # y no se repite
+
+    plan = Planner().plan(world)
+
+    assert plan.complete
+    assert (1, 2) not in plan.final_world.holes
+    assert not plan.final_world.diamonds
+    assert simulate(world, plan.actions).player == (1, 4)
+
+
+def test_hint_roca_waypoints_encadenados():
+    """
+    Dos waypoints de la misma roca en orden: primero dejarla en (0,3) y
+    luego meterla al hoyo (0,5). Cada tramo es un A* chico.
+    """
+    world = World(
+        rows=1,
+        cols=6,
+        player=(0, 0),
+        rocks=frozenset({(0, 1)}),
+        holes=frozenset({(0, 5)}),
+        hints=[
+            ("roca (0, 3)", frozenset({(0, 3)}), (0, 3)),
+            ("hoyo (0, 5)", frozenset({(0, 5)}), (0, 5)),
+        ],
+    )
+    plan = Planner().plan(world)
+
+    assert plan.complete
+    final = simulate(world, plan.actions)
+    assert not final.holes
+    assert (0, 5) not in final.rocks  # la roca se consumio en el hoyo
+
+
+def test_hint_ya_cumplida_no_se_reintenta():
+    """
+    Nivel a medias: la pista "roca al hoyo" ya esta cumplida (el hoyo no
+    esta en `holes`). Su predicado de exito da True, asi que el
+    planificador no rehace la pista y completa el resto normalmente.
+    """
+    world = World(
+        rows=3,
+        cols=5,
+        player=(1, 0),
+        diamonds=frozenset({(1, 4)}),
+        walls=_corredor([0, 2]),
+        hints=[("hoyo (1, 2)", frozenset({(1, 2)}), (1, 2))],
+    )
+    assert any(
+        pred(world)
+        for pred in _successes_for("hoyo (1, 2)", frozenset({(1, 2)}), world)
+    )
+
+    plan = Planner().plan(world)
+
+    assert plan.complete
+    assert simulate(world, plan.actions).player == (1, 4)
+
+
+def test_sin_level_no_hay_hints():
+    """Sin `level` (o sin entrada) no se inyectan pistas."""
+    grid = np.ones((3, 3), dtype=np.uint8)
+    state = GameState(
+        grid=grid,
+        graph_nodes=set(),
+        adjacency={},
+        player_cell=(0, 0),
+        objects=[],
+        objects_by_cell={},
+        origin_x=0,
+        origin_y=0,
+        tile_size=1,
+    )
+
+    assert world_from_state(state).hints == []
+    assert world_from_state(state, level=999).hints == []
+
+
+def test_hint_cumplida_no_bloquea_keep_reachable():
+    """
+    Regresion (nivel 10): una pista YA CUMPLIDA no debe entrar en
+    `keep_reachable`.
+
+    `_goals_of` emite las pistas aunque ya esten resueltas (p. ej. un
+    hoyo rellenado). Si `resolve` las contaba como metas pendientes, su
+    celda quedaba en `keep_reachable` y podaba el unico camino valido en
+    cuanto exigia activar un pico.
+
+    Mundo minimo: corredor (0,0) personaje -> (0,1) pico -> (0,2)
+    diamante. La pista `diamante (0,2)` (pendiente) fuerza el fallback;
+    la pista `hoyo (0,0)` ya esta cumplida ((0,0) no es un hoyo). Cruzar
+    el pico activa (0,1) y deja (0,0) aislado: con el bug, la celda
+    (0,0) de la pista cumplida bloquea el paso y el plan queda
+    incompleto.
+    """
+    world = World(
+        rows=1,
+        cols=3,
+        player=(0, 0),
+        spikes=frozenset({(0, 1)}),
+        diamonds=frozenset({(0, 2)}),
+        hints=[
+            ("hoyo (0,0)", frozenset({(0, 0)}), None),      # cumplida
+            ("diamante (0,2)", frozenset({(0, 2)}), None),  # pendiente
+        ],
+    )
+    # La pista "hoyo (0,0)" esta satisfecha: (0,0) no esta en `holes`.
+    assert not world.holes
+
+    plan = Planner().plan(world)
+
+    assert plan.complete, plan.pending
+    assert not simulate(world, plan.actions).diamonds

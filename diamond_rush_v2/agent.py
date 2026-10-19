@@ -112,6 +112,16 @@ class Agent:
         if plan is None:
             plan = self.compute()
 
+        # Un plan incompleto no se ejecuta: mover al personaje con metas
+        # pendientes dejaria el nivel en un estado peor (picos activados,
+        # rocas consumidas) sin resolverlo. Se informa y se corta.
+        if not plan.complete:
+            print(
+                "Plan incompleto: no se ejecuta (no se envian teclas). "
+                f"Metas pendientes: {plan.pending}"
+            )
+            return plan
+
         self._verify_simulation(plan)
 
         if self.keyboard is None:

@@ -54,6 +54,7 @@ from typing import (
 
 import button_gate
 import config
+import level_hints
 from perception.state import GameState
 
 Cell = Tuple[int, int]
@@ -145,7 +146,16 @@ class World:
     # declara por nivel en button_gate.py; lo no declarado se infiere por
     # cercania global, 1:1.
     button_gate: Dict[Cell, Cell] = field(default_factory=dict)
+    # Pistas de subobjetivos por nivel (level_hints.py): una lista
+    # ordenada de (nombre, meta, rock_goal). Son PREFERENCIAS que el
+    # respaldo resuelve primero; se revalidan contra lo percibido en
+    # world_from_state. No es parte de la dinamica, asi que no entra en
+    # `_state_key` ni la tocan las transiciones.
+    hints: List[Tuple[str, FrozenSet[Cell], Optional[Cell]]] = field(
+        default_factory=list
+    )
     doors: FrozenSet[Cell] = frozenset()
+
     keys: FrozenSet[Cell] = frozenset()
     has_key: bool = False
     exit: Optional[Cell] = None
@@ -224,7 +234,8 @@ def world_from_state(
 
     `level` (1..20) habilita el mapeo explicito boton->reja de
     button_gate.py; sin el se empareja por cercania (ver
-    _button_gate_map).
+    _button_gate_map). Tambien habilita la secuencia de subobjetivos de
+    level_hints.py (`World.hints`), validada contra lo percibido.
     """
     roles = roles or ROLES
     grid = state.grid.tolist()
@@ -283,6 +294,7 @@ def world_from_state(
         all_gates=frozenset(gates),
         buttons=frozenset(buttons),
         button_gate=_button_gate_map(level, buttons, gates),
+        hints=_hints_from_level(level, grid, holes, buttons, keys, doors, diamonds),
         doors=frozenset(doors),
         keys=frozenset(keys),
         # Capacidad 1 + consumo: como el nivel tiene igual numero de
@@ -356,6 +368,70 @@ def _match_buttons_to_gates(
         used_g.add(g)
         mapping[b] = g
     return mapping
+
+
+def _hints_from_level(
+    level: Optional[int],
+    grid: List[List[int]],
+    holes: Set[Cell],
+    buttons: Set[Cell],
+    keys: Set[Cell],
+    doors: Set[Cell],
+    diamonds: Set[Cell],
+) -> List[Tuple[str, FrozenSet[Cell], Optional[Cell]]]:
+    """
+    Traduce la secuencia declarada en level_hints.py a subobjetivos
+    validos para ESTE estado percibido.
+
+    Cada entrada se revalida: si la celda ya no existe como el objeto
+    esperado (p. ej. el tester ya recogio la llave o relleno el hoyo), la
+    entrada se ignora y el planificador cae a la composicion automatica;
+    asi la secuencia funciona tambien con el nivel a medias. Un
+    `("roca", origen, destino)` se normaliza segun el destino: hoyo ->
+    `"hoyo ..."`, boton -> `"boton ..."`, otra celda de piso ->
+    `"roca ..."`, todos con `rock_goal=destino` (el origen es informativo:
+    el A* usa la roca mas cercana que pueda empujar). Un destino que no
+    sea hoyo, boton ni piso transitable se descarta.
+    """
+    if level is None:
+        return []
+    spec = level_hints.LEVEL_SEQUENCE.get(level, [])
+    rows = len(grid)
+    cols = len(grid[0]) if grid else 0
+    hints: List[Tuple[str, FrozenSet[Cell], Optional[Cell]]] = []
+    for item in spec:
+        if not item:
+            continue
+        kind = item[0]
+        if kind in ("llave", "puerta", "diamante", "hoyo"):
+            if len(item) != 2:
+                continue
+            cell = tuple(item[1])
+            existe = (
+                (kind == "llave" and cell in keys)
+                or (kind == "puerta" and cell in doors)
+                or (kind == "diamante" and cell in diamonds)
+                or (kind == "hoyo" and cell in holes)
+            )
+            if not existe:
+                continue
+            hints.append((f"{kind} {cell}", frozenset({cell}), None))
+            continue
+        if kind == "roca":
+            if len(item) != 3:
+                continue
+            dest = tuple(item[2])
+            r, c = dest
+            if not (0 <= r < rows and 0 <= c < cols):
+                continue
+            if dest in holes:
+                hints.append((f"hoyo {dest}", frozenset({dest}), dest))
+            elif dest in buttons:
+                hints.append((f"boton {dest}", frozenset({dest}), dest))
+            elif grid[r][c]:
+                hints.append((f"roca {dest}", frozenset({dest}), dest))
+            # destino muro / inexistente -> se ignora
+    return hints
 
 
 # ---------------------------------------------------------------
@@ -691,6 +767,30 @@ def wall_distance_field(world: World, goals: Iterable[Cell]) -> Dict[Cell, int]:
     return dist
 
 
+def _reachable_bare(world: World) -> FrozenSet[Cell]:
+    """
+    Celdas alcanzables desde el personaje por la topologia "pelada"
+    (ignora hoyos, rejas, puertas y rocas, que pueden despejarse), pero
+    respetando los muros fijos y los picos YA activados (que viven en
+    `walls`). Se usa como seguridad de picos: un movimiento irreversible
+    que activa un pico solo se permite si no deja aislada ninguna meta
+    pendiente en esta topologia.
+    """
+    visited: Set[Cell] = {world.player}
+    queue = deque([world.player])
+    while queue:
+        cell = queue.popleft()
+        for neighbor in _neighbors(world, cell):
+            if (
+                world.in_bounds(neighbor)
+                and neighbor not in world.walls
+                and neighbor not in visited
+            ):
+                visited.add(neighbor)
+                queue.append(neighbor)
+    return frozenset(visited)
+
+
 def heuristic(world: World, goals: FrozenSet[Cell]) -> float:
     """
     Distancia del personaje a la meta mas cercana segun el campo de
@@ -755,6 +855,12 @@ def _successes_for(
     salir no sirve para cruzar la propia reja); el personaje encima
     queda como ultimo recurso.
     """
+    if name.startswith("roca"):
+        # Pista "empujar una roca a esta celda de piso": exito cuando la
+        # roca queda encima. Si el destino fuera hoyo o boton, la pista
+        # se habria normalizado como "hoyo"/"boton" y se usan sus
+        # predicados (relleno / roca sobre la placa).
+        return [lambda world: bool(goals & world.rocks)]
     if name.startswith("diamante"):
         return [lambda world: world.player in goals]
     if name.startswith("llave"):
@@ -768,10 +874,19 @@ def _successes_for(
         # igual que las llaves, por si el plan se mueve tras abrirla.
         return [lambda world: not (goals & world.doors)]
     if name.startswith("boton") and _es_temporal(world):
-        return [
-            lambda world: bool(goals & world.rocks),
-            lambda world: world.player in goals,
+        # Con reja temporal solo una ROCA encima la deja abierta de forma
+        # util. El personaje encima queda como ultimo recurso SOLO si la
+        # reja no es instrumental: si bloquea una meta pendiente, pisar y
+        # salir la cierra, asi que aceptar "el personaje encima" seria un
+        # exito falso que cicla el fallback (nivel 11: el boton (3,7) con
+        # la reja (4,6) tapando el diamante (4,5)).
+        preds: List[Callable[[World], bool]] = [
+            lambda world: bool(goals & world.rocks)
         ]
+        button = next(iter(goals), None)
+        if button is None or not _reja_bloquea(world, button):
+            preds.append(lambda world: world.player in goals)
+        return preds
     return [lambda world: _reached(world, goals)]
 
 
@@ -923,6 +1038,8 @@ def a_star(
     success: Optional[Callable[[World], bool]] = None,
     allow_spike_activation: bool = True,
     allow_rock_on_diamond: bool = True,
+    rock_goal: Optional[Cell] = None,
+    keep_reachable: FrozenSet[Cell] = frozenset(),
 ) -> Optional[Tuple[List[Action], World]]:
     """
     A* ponderado sobre el espacio de mundos completos. Devuelve
@@ -935,6 +1052,15 @@ def a_star(
     Con `allow_spike_activation=False` no activa picos; con
     `allow_rock_on_diamond=False` no deja rocas sobre diamantes
     (ver `_step`).
+
+    `rock_goal` (una celda meta que hay que CUBRIR con una roca, p. ej.
+    colocar una roca sobre un boton) añade a la heuristica la distancia
+    de la roca mas cercana a esa celda, guiando el empuje y acelerando la
+    busqueda de los puzzles Sokoban. `keep_reachable` lista celdas de
+    metas todavia pendientes que deben seguir siendo alcanzables: se
+    descartan los sucesores que activan un pico y dejan alguna de esas
+    celdas aislada (seguridad generica de picos: no cortar el camino a
+    otro objetivo con un movimiento irreversible).
     """
     reached = success or (lambda w: _reached(w, goals))
     if reached(world):
@@ -943,9 +1069,24 @@ def a_star(
     field = wall_distance_field(world, goals)
     if world.player not in field:
         return None
+    reverse = (
+        wall_distance_field(world, {rock_goal})
+        if rock_goal is not None
+        else None
+    )
+
+    def h_of(state: World) -> float:
+        base = field.get(state.player, float("inf"))
+        if base == float("inf") or reverse is None:
+            return base
+        toca = min(
+            (reverse[r] for r in state.rocks if r in reverse),
+            default=0,
+        )
+        return base + toca
 
     open_heap: List[Tuple[float, float, int, World, Tuple[Action, ...]]] = []
-    heapq.heappush(open_heap, (weight * field[world.player], 0.0, 0, world, ()))
+    heapq.heappush(open_heap, (weight * h_of(world), 0.0, 0, world, ()))
     visited: Set[tuple] = set()
     counter = 1
     nodes = 0
@@ -969,7 +1110,13 @@ def a_star(
             state_key = _state_key(successor)
             if state_key in visited:
                 continue
-            h = field.get(successor.player, float("inf"))
+            if (
+                keep_reachable
+                and successor.spikes != current.spikes
+                and not keep_reachable <= _reachable_bare(successor)
+            ):
+                continue
+            h = h_of(successor)
             if h == float("inf"):
                 continue
             counter += 1
@@ -992,6 +1139,7 @@ def backtracking_search(
     success: Optional[Callable[[World], bool]] = None,
     allow_spike_activation: bool = True,
     allow_rock_on_diamond: bool = True,
+    keep_reachable: FrozenSet[Cell] = frozenset(),
 ) -> Optional[Tuple[List[Action], World]]:
     """
     DFS con backtracking sobre el espacio de mundos. Prioriza las
@@ -999,7 +1147,9 @@ def backtracking_search(
     deshace de ramas sin salida con `visited` + tope de profundidad.
     Con `allow_spike_activation=False` no activa picos; con
     `allow_rock_on_diamond=False` no deja rocas sobre diamantes
-    (ver `_step`).
+    (ver `_step`). `keep_reachable` lista metas pendientes que deben
+    seguir siendo alcanzables (seguridad generica de picos, igual que en
+    `a_star`).
     """
     reached = success or (lambda w: _reached(w, goals))
     if reached(world):
@@ -1033,6 +1183,12 @@ def backtracking_search(
         for action, successor in reversed(successors):
             if _state_key(successor) in visited:
                 continue
+            if (
+                keep_reachable
+                and successor.spikes != current.spikes
+                and not keep_reachable <= _reachable_bare(successor)
+            ):
+                continue
             stack.append((successor, plan + (action,), depth + 1))
 
     return None
@@ -1047,11 +1203,9 @@ def _es_profunda(world: World, cell: Cell) -> bool:
     evite hoyos Y picos, pero si uno que solo evite hoyos. Tales metas
     quedan "dentro" del bolsillo tras el cruce (los picos actuan en un
     solo sentido), asi que _goals_of las pospone para barrerlas en una
-    sola ida. Solo aplica con hoyos en el mundo: sin ellos no hay nada
-    que rellenar antes y el orden clasico ya funciona.
+    sola ida. Aplica tambien sin hoyos: un pico sigue siendo un cruce
+    irreversible que conviene hacer al final.
     """
-    if not world.holes:
-        return False
     if _path_avoiding(
         world, world.player, cell, avoid=world.holes | world.spikes
     ) is not None:
@@ -1107,15 +1261,38 @@ def _goals_of(world: World):
     si uno queda inalcanzable se marca pendiente sin perder la
     planificacion del resto. Los hoyos repetidos entre metas se
     deduplican con `seen_holes`.
+
+    Si `world.hints` trae la secuencia declarada por nivel (level_hints),
+    esos subobjetivos van PRIMERO, en su orden: son preferencias del
+    usuario y se resuelven uno por A* antes de la composicion
+    automatica. `world_from_state` ya revalido sus celdas contra lo
+    percibido; aqui solo se evita repetir una meta ya emitida.
     """
     seen_holes: Set[Cell] = set()
+    emitted: Set[FrozenSet[Cell]] = set()
+
+    # Pistas por nivel primero (preferencias), en el orden declarado.
+    for name, goals, _rock in world.hints:
+        if goals and goals not in emitted:
+            emitted.add(goals)
+            yield name, goals
 
     def holes_for(cell: Cell):
         """Hoyos que cortan la ida o el retorno a `cell` (sin repetir)."""
         for hole in holes_blocking(world, cell):
             if hole not in seen_holes:
                 seen_holes.add(hole)
-                yield f"hoyo {hole}", frozenset({hole})
+                goals = frozenset({hole})
+                if goals not in emitted:
+                    emitted.add(goals)
+                    yield f"hoyo {hole}", goals
+
+    def emit(name: str, goals: FrozenSet[Cell]):
+        """Un subobjetivo, salvo que su meta ya se haya emitido."""
+        if goals and goals not in emitted:
+            emitted.add(goals)
+            return name, goals
+        return None
 
     llaves = sorted(world.keys)
     diamantes = sorted(world.diamonds)
@@ -1124,7 +1301,9 @@ def _goals_of(world: World):
 
     for cell in (c for c in llaves if c not in llaves_p):
         yield from holes_for(cell)
-        yield f"llave {cell}", frozenset({cell})
+        item = emit(f"llave {cell}", frozenset({cell}))
+        if item is not None:
+            yield item
     for cell in llaves_p + diam_p:
         yield from holes_for(cell)
     for cell in sorted(world.buttons):
@@ -1135,18 +1314,40 @@ def _goals_of(world: World):
         # el paso a una meta pendiente.
         if _es_temporal(world) and not _reja_bloquea(world, cell):
             continue
-        yield f"boton {cell}", frozenset({cell})
+        item = emit(f"boton {cell}", frozenset({cell}))
+        if item is not None:
+            yield item
     for cell in (c for c in diamantes if c not in diam_p):
         yield from holes_for(cell)
-        yield f"diamante {cell}", frozenset({cell})
+        item = emit(f"diamante {cell}", frozenset({cell}))
+        if item is not None:
+            yield item
     for cell in llaves_p:
         yield from holes_for(cell)
-        yield f"llave {cell}", frozenset({cell})
+        item = emit(f"llave {cell}", frozenset({cell}))
+        if item is not None:
+            yield item
     for cell in diam_p:
         yield from holes_for(cell)
-        yield f"diamante {cell}", frozenset({cell})
+        item = emit(f"diamante {cell}", frozenset({cell}))
+        if item is not None:
+            yield item
     if world.exit is not None and world.exit_unlocked:
-        yield "salida", frozenset({world.exit})
+        item = emit("salida", frozenset({world.exit}))
+        if item is not None:
+            yield item
+
+
+def _hint_rock_goal(world: World, name: str) -> Optional[Cell]:
+    """
+    Celda destino declarada en una pista de `world.hints` con ese `name`,
+    o None si no hay pista (o no lleva `rock_goal`). Se usa para guiar el
+    empuje Sokoban con la heuristica rock-aware.
+    """
+    for hint_name, _goals, rock_goal in world.hints:
+        if hint_name == name and rock_goal is not None:
+            return rock_goal
+    return None
 
 
 def _reachable_avoiding_holes(world: World, target: Cell) -> bool:
@@ -1210,6 +1411,10 @@ class Planner:
        botones, diamantes uno por uno y salida, con A* y respaldo de
        retroceso por meta.
 
+    Si el World trae `hints` (secuencia declarada por nivel en
+    level_hints.py), se salta la fase global y se va directo al respaldo
+    dirigido, con los subobjetivos de la pista primero.
+
     Devuelve un Plan (posiblemente incompleto si queda algo
     inalcanzable).
     """
@@ -1222,6 +1427,17 @@ class Planner:
         # El mundo del planificador arranca tras recolectar lo que el
         # personaje ya pisa (y desbloqueando la salida si no hay gemas).
         current = _collect(world)
+        # Con pistas por nivel (level_hints), el camino principal es la
+        # composicion dirigida: un A* por subobjetivo en el orden
+        # declarado, en vez del A* global (que en el nivel 6 se queda sin
+        # presupuesto y en el 10 no converge). Si TODAS las pistas ya
+        # estan cumplidas (nivel a medias), se sigue con la busqueda
+        # global normal para el resto.
+        if any(
+            not any(s(current) for s in _successes_for(name, goals, current))
+            for name, goals, _rock in current.hints
+        ):
+            return self._plan_fallback(world)
         actions: List[Action] = []
         if current.diamonds:
             result = a_star(
@@ -1285,6 +1501,11 @@ class Planner:
         # Metas que ya fracasaron en el mundo actual: no se reintentan
         # mientras el mundo no avance.
         failed: Set[FrozenSet[Cell]] = set()
+        # Pistas de nivel ya logradas. Un waypoint de roca es NO monotonico
+        # (la roca puede abandonar la celda objetivo en un tramo posterior
+        # del Sokoban), asi que una vez cumplido no debe re-encolarse.
+        hint_ids = {(name, goals) for name, goals, _rock in current.hints}
+        done_hints: Set[FrozenSet[Cell]] = set()
         pending: List[str] = []
         global_retries = 0
 
@@ -1293,13 +1514,14 @@ class Planner:
                 pending.append(name)
 
         def enqueue() -> deque:
-            # Metas del mundo actual, SIN las que ya estan logradas ni
-            # las que ya fracasaron.
+            # Metas del mundo actual, SIN las que ya estan logradas, las
+            # que ya fracasaron ni las pistas ya cumplidas.
             return deque(
                 (name, goals)
                 for name, goals in _goals_of(current)
                 if not any(s(current) for s in _successes_for(name, goals, current))
                 and goals not in failed
+                and goals not in done_hints
             )
 
         def resolve(
@@ -1308,13 +1530,19 @@ class Planner:
             astar_budget: int,
             solo_seguro: bool = False,
         ):
-            # Prueba los predicados de exito en orden: primero "pisar la
-            # meta", luego "el objeto desaparecio". Para cada uno intenta
-            # A* y, si no hay camino, el retroceso. Tres pasadas:
+            # Prueba los predicados de exito en orden de preferencia. Para
+            # cada predicado se intenta A* y, si no hay camino, el
+            # retroceso, en tres pasadas de seguridad:
             #   1) sin activar picos ni rocas sobre diamantes (seguro);
             #   2) activando picos si hace falta (el pico es la unica
             #      via) pero sin rocas sobre diamantes;
             #   3) todo permitido (ultimo recurso).
+            # El bucle EXTERNO es el de predicados: cada uno se agota en
+            # los tres modos antes de pasar al siguiente. Con el orden
+            # inverso, un predicado barato en modo seguro (p. ej. "el
+            # personaje sobre el boton") ganaba al predicado correcto que
+            # solo es alcanzable activando un pico ("roca sobre el
+            # boton"), dando un plan falso (nivel 11).
             # Con `solo_seguro=True` (hay hoyos abiertos que cortan la
             # ida/vuelta a la meta) se queda en la pasada 1: activar un
             # pico antes de rellenar esos hoyos dejaria el retorno
@@ -1327,8 +1555,31 @@ class Planner:
                     (True, True),
                 )
             )
-            for spikes, rocks in modes:
-                for success in _successes_for(name, goals, current):
+            success_preds = _successes_for(name, goals, current)
+            # Seguridad generica de picos: celdas de las DEMAS metas
+            # PENDIENTES que no deben quedar aisladas por activar un pico.
+            # Se excluyen las metas ya cumplidas: `_goals_of` emite las
+            # pistas aunque ya esten resueltas (p. ej. un hoyo rellenado),
+            # y exigir que sigan alcanzables metia una celda ya cumplida
+            # en `keep_reachable`, podando el unico camino valido (nivel
+            # 10: rellenar (8,2) exige cruzar el pico (8,4) yendo al sur,
+            # que "aisla" el hoyo (8,7) ya rellenado).
+            keep_reachable = frozenset(
+                celda
+                for _n, g in _goals_of(current)
+                if g != goals
+                and not any(s(current) for s in _successes_for(_n, g, current))
+                for celda in g
+            )
+            # Guia rock-aware: una pista de nivel trae su celda destino
+            # (una roca al hoyo/boton/celda); si no, el primer predicado
+            # de un boton temporal usa el propio boton como destino.
+            hint_rock = _hint_rock_goal(current, name)
+            for indice, success in enumerate(success_preds):
+                rock_goal = hint_rock
+                if rock_goal is None and name.startswith("boton") and indice == 0:
+                    rock_goal = next(iter(goals), None)
+                for spikes, rocks in modes:
                     result = a_star(
                         current,
                         goals,
@@ -1336,6 +1587,8 @@ class Planner:
                         success=success,
                         allow_spike_activation=spikes,
                         allow_rock_on_diamond=rocks,
+                        rock_goal=rock_goal,
+                        keep_reachable=keep_reachable,
                     )
                     if result is None:
                         result = backtracking_search(
@@ -1346,6 +1599,7 @@ class Planner:
                             success=success,
                             allow_spike_activation=spikes,
                             allow_rock_on_diamond=rocks,
+                            keep_reachable=keep_reachable,
                         )
                     if result is not None:
                         return result
@@ -1426,6 +1680,10 @@ class Planner:
             actions.extend(steps)
             if name in pending:
                 pending.remove(name)
+            # Una pista ya resuelta no se vuelve a perseguir (su roca
+            # puede haberse movido a otro tramo).
+            if (name, goals) in hint_ids:
+                done_hints.add(goals)
             # Reintentar lo fallido solo si el mundo avanzo de verdad
             # (pasos nuevos o cambio de estado). Con rejas temporales un
             # boton puede "resolverse" sin dejar progreso persistente (el
@@ -1482,7 +1740,12 @@ class Planner:
             # Si alguna meta pendiente quedo sin ninguna ruta posible,
             # abortar (evita el bucle de re-cola de hoyos cuya roca
             # quedo inalcanzable).
-            remaining = [g for _, g in _goals_of(current) if g not in failed]
+            remaining = [
+                g
+                for n, g in _goals_of(current)
+                if g not in failed
+                and not any(s(current) for s in _successes_for(n, g, current))
+            ]
             if remaining and not _is_solvable(current, remaining):
                 for name_r, goals_r in _goals_of(current):
                     if goals_r not in failed and not any(
