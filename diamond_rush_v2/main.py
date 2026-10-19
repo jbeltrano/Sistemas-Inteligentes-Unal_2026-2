@@ -63,7 +63,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # test_recognition(config.BASE_DIR / "test.png")
-    # test_recognition(config.LEVELS_DIR / "level19.png")
+    # test_recognition(config.LEVELS_DIR / "level20.png")
     # test_recognition_all_levels()
     run_agent(
         execute=not args.no_execute,

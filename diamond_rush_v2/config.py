@@ -76,7 +76,7 @@ MAX_NODES_HOLE = 250_000
 # El juego se maneja con las flechas. Cada dirección del plan es una
 # flecha que se manda al canvas por Selenium (no hay scraping: solo
 # pulsaciones).
-STEP_SECONDS = 0.40            # pausa entre pasos del plan (en segundos)
+STEP_SECONDS = 0.18            # pausa entre pasos del plan (en segundos)
 PRESS_SECONDS = 0.08           # cuánto se mantiene la flecha presionada (el juego exige un mínimo)
 # Cada cuántos pasos re-percibir durante la ejecución (evita un pantallazo
 # por paso):

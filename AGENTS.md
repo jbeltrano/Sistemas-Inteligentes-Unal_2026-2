@@ -1,63 +1,66 @@
 # AGENTS.md
 
-Repositorio del curso Sistemas Inteligentes (UNAL 2026-2). Un solo proyecto activo: `diamond_rush_v2/` (agente que juega Diamond Rush en el navegador). Sin tooling compartido: no hay CI, ni linter, ni configuración de tipos.
+Curso Sistemas Inteligentes (UNAL 2026-2). Un solo proyecto activo: `diamond_rush_v2/` — agente deliberativo (sin aprendizaje) que juega Diamond Rush en el navegador: percepción (1 frame por Selenium) → decisión (A* ponderado + retroceso) → control (flechas por Selenium) → verificación con re-planificación. Sin CI, ni linter, ni typecheck; la única verificación es pytest.
 
 **Idioma:** READMEs, comentarios, docstrings, prints y mensajes de commit van en español.
 
-## `diamond_rush_v2/` — único proyecto
+## Setup
 
-Agente deliberativo basado en modelos (sin aprendizaje). Ciclo: percepción (1 frame vía Selenium) → decisión (A* ponderado + retroceso) → control (flechas por Selenium) → verificación con re-planificación.
-
-```
-# desde dentro de diamond_rush_v2/
-python main.py                       # agente completo (requiere Chrome con debugging, ver abajo)
-python main.py --no-execute          # solo percibir y planificar, sin mandar teclas
-python main.py --debug               # imprime el GameState completo
-python main.py --verify-every 1      # re-percibe cada paso (por defecto: cada 10; 0 = solo al final)
+```bash
+pip install -r diamond_rush_v2/requirements.txt   # pinned; en un venv
+pip install pytest                                # NO está en requirements.txt
 ```
 
-- Deps en `diamond_rush_v2/requirements.txt` (numpy, opencv-python, selenium, pytest); instalar dentro de un venv. No hay requirements en la raíz.
-- Ejecutar siempre desde dentro de `diamond_rush_v2/`: no hay paquete instalable, los imports son planos (`from agent import Agent`) y dependen del CWD. `tests/conftest.py` mete la raíz del proyecto en `sys.path` para que pytest funcione desde cualquier lado.
+## Comandos
 
-### Chrome con debugging (requisito para correr el agente)
+```bash
+# El agente (funciona desde la raíz o desde diamond_rush_v2/;
+# los imports son planos, por eso no sirve `import agent` en un REPL
+# sin tener diamond_rush_v2/ en sys.path)
+python diamond_rush_v2/main.py                    # agente completo (requiere Chrome, ver abajo)
+python diamond_rush_v2/main.py --no-execute       # solo percibir y planificar, sin mandar teclas
+python diamond_rush_v2/main.py --debug            # imprime el GameState completo
+python diamond_rush_v2/main.py --verify-every 1   # re-percibe cada paso; 0 = solo al final;
+                                                  # por defecto: cada 10 (config.VERIFY_EVERY)
+python diamond_rush_v2/main.py --level 6          # nivel actual; activa el mapeo botón→reja
+                                                  # de button_gate.py (varios pares)
 
-El agente se conecta por CDP a un Chrome ya abierto (`perception/capture.py:attach_driver()`, `127.0.0.1:9222`) sin navegar. El comando está en `Ejecucion.md` (raíz del repo):
-
+# Tests: solo pytest, sin navegador (~32 tests, ~2 min). Sirve desde
+# diamond_rush_v2/ o desde la raíz (tests/conftest.py mete la raíz del
+# proyecto en sys.path)
+pytest
+pytest tests/test_planificacion.py
+pytest tests/test_planificacion.py::test_a_star_devuelve_camino_optimo
 ```
+
+**Ojo con los skips:** dos tests de integración (`test_recognize_y_plan_consistente`, `test_nivel5_picos_sin_recrucex`) corren `recognize` sobre `assets/levels/level5.png` y hacen `pytest.skip` si el reconocimiento falla. Un resultado esencialmente verde puede esconder una regresión de percepción — mirar si alguien pasó a skip.
+
+## Chrome con debugging (requisito para correr el agente)
+
+`perception/capture.py:attach_driver()` se conecta por CDP a un Chrome ya abierto (`127.0.0.1:9222`) sin navegar. El comando está en `Ejecucion.md` (raíz del repo):
+
+```powershell
 & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\Users\juanp\chrome-agente"
 ```
 
-Hay que pasar el tutorial a mano y dejar el nivel en pantalla antes de correr `main.py`. **Nunca llamar `driver.quit()`** sobre el driver de `attach_driver()`: cierra el navegador abierto a mano con el progreso del nivel.
+Abrir `https://www.minijuegos.com/embed/diamond-rush`, pasar el tutorial a mano y dejar el nivel en pantalla antes de correr `main.py`. **Nunca llamar `driver.quit()`** sobre el driver de `attach_driver()`: cierra el navegador con el progreso del nivel. Cerrar Chrome a mano.
 
-### Arquitectura por capas (contrato fuerte)
+## Arquitectura por capas (contrato fuerte)
 
-`GameState` (`perception/state.py`) es el **único** contrato entre percepción y el resto. Regla: `computation/` y `play/` importan **solo** de `perception.state` y `config`, nunca de `cv2` ni de `recognition.py`. Detalle completo del contrato en `perception/README.md` (leerlo antes de tocar percepción ni planificación).
+`GameState` (`perception/state.py`) es el **único** contrato entre percepción y el resto. Regla: `computation/` y `play/` importan **solo** de `perception.state` y `config`, nunca de `cv2` ni de `recognition.py` (verificado por grep; `agent.py` es el único que cierra el lazo). **Leer `perception/README.md` antes de tocar percepción ni planificación**: documenta campo por campo el contrato, cómo se usa en A\* y las limitaciones conocidas.
 
 - `perception/` — captura (Selenium sobre el canvas) y reconocimiento (templates + máscara HSV de suelo). Produce un `GameState` por frame.
-- `computation/` — modelo (`World`) y planificación: A* ponderado (`A_STAR_WEIGHT = 2.0`) sobre el espacio de mundos (posición + rocas + diamantes + picos), con `backtracking_search` (DFS) de respaldo si A* se queda sin presupuesto. Heurística: campo de distancias BFS multi-fuente sobre la grilla sin rocas (admisible). Planifica en fases: **búsqueda global de recolección** (todos los diamantes en un solo A*; llaves/rejas/botones instrumentales) → salida; si la global revienta el presupuesto, respaldo con la composición clásica de subobjetivos (llaves → botones → diamantes → salida). Los picos retraídos se activan permanentemente al salir de la celda (una sola cruzada).
-- `play/` — control: cada dirección del plan es una flecha enviada al canvas por Selenium (`ActionChains` key_down → pausa → key_up en un solo `perform()`; dos `perform()` separados mueven dos casillas).
-- `agent.py` — cierra el lazo: ejecuta el plan y, cada `VERIFY_EVERY` pasos, re-percibe ("settle" hasta que la celda del personaje se asiente) y re-planifica si hay desvío (tope `MAX_REPLANS`).
+- `computation/` — modelo (`World`) y planificación: A* ponderado (`A_STAR_WEIGHT = 2.0`) sobre el espacio de mundos, con `backtracking_search` (DFS) de respaldo si A* se queda sin presupuesto. Planifica en fases: **búsqueda global de recolección** (todos los diamantes en un solo A*; llaves/rejas/botones instrumentales) → salida; si la global revienta el presupuesto, `_plan_fallback` compone subobjetivos (llaves → botones → diamantes → salida). Presupuestos y pesos en `config.py`. Las rejas son **temporales** (abiertas solo mientras su botón esté cubierto por el personaje o una roca): el emparejamiento botón→reja es 1:1 y, con varios pares, se declara por nivel en `button_gate.py` (se pasa con `--level N`; lo no declarado se empareja por cercanía).
+- `play/` — control: cada dirección es una flecha enviada al canvas en **una sola** `ActionChains.perform()` (key_down → pausa → key_up). Dos `perform()` separados = dos casillas de movimiento (bug ya corregido, ver docstring de `Keyboard.press`).
+- `agent.py` — cierra el lazo: ejecuta el plan y, cada `VERIFY_EVERY` pasos, re-percibe con "settle" (`_settle`: espera a que la celda del personaje se asiente) y re-planifica si hay desvío (tope `MAX_REPLANS = 50`).
 
-### Tests
+## Depuración de percepción
 
-Solo pytest, dentro de `diamond_rush_v2/`:
-
-```
-# desde diamond_rush_v2/
-pytest                                   # toda la suite (~21 tests)
-pytest tests/test_planificacion.py       # un módulo
-pytest tests/test_planificacion.py::test_plan_completo_sin_grafo   # un test
-```
-
-Los tests del planificador son de lógica pura (usan `World` directo, sin OpenCV ni navegador). No hay tests de percepción ni end-to-end.
-
-### Depuración de percepción
-
-- `debug.py` no se usa desde `agent.py`; es solo para revisar a mano: descomentar las llamadas en `main.py` (`test_recognition(path)`, `test_recognition_all_levels()`).
+- `debug.py` no se usa desde `agent.py`; es manual: descomentar las llamadas en `main.py` (`test_recognition(path)`, `test_recognition_all_levels()`). Escribe `debug_paths.png`, `debug_graph.png`, `debug_result.png` (gitignoreados).
 - Si `recognize` falla, `agent._report_miss` guarda el frame en `debug_misses/` (gitignoreado) para analizarlo con `test_recognition`.
 
-## Hechos compartidos (geometría y percepción)
+## Geometría y percepción
 
 - **Tablero:** siempre 15 filas × 10 columnas (`config.BOARD_ROWS/COLS`). `tile_size = min(ancho//10, alto//15)`, no se estima. El HUD se dibuja **encima** del tablero (no lo desplaza); las celdas bajo `HUD_HEIGHT` valen 0. Celdas `(fila, col)`, píxeles `(x, y)` — cuidado con el orden.
-- **Templates:** `assets/templates/` son recortes a mano de un frame concreto; si el juego se ve distinto dejan de matchear y hay que recalibrar `THRESHOLD`/`MIN_PATH_FRACTION` (`config.py`) por nivel. Primera cosa a revisar ante suelo/objetos mal detectados: la máscara de caminos HSV (`debug_paths.png`).
-- **Sin scraping:** el estado del juego se lee solo de píxeles (templates/máscara). Selenium se usa únicamente para encuadrar el canvas y pulsar flechas, nunca para extraer datos del juego por HTTP/DOM/JS.
+- **Templates:** `assets/templates/` son recortes a mano de un frame concreto; si el juego se ve distinto dejan de matchear y hay que recalibrar `THRESHOLD`/`MIN_PATH_FRACTION` (`config.py`) por nivel. Ante suelo/objetos mal detectados, revisar primero la máscara de caminos HSV (`debug_paths.png`).
+- **Sin scraping:** el estado se lee solo de píxeles (templates/máscara). Selenium se usa únicamente para encuadrar el canvas y pulsar flechas, nunca para extraer datos del juego por HTTP/DOM/JS.
