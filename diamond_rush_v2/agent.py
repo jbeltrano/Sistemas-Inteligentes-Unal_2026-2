@@ -112,16 +112,23 @@ class Agent:
         Envia por teclado las acciones del plan (control) y cierra el
         lazo: cada `verify_every` pasos re-percibe y compara la celda real
         con la esperada; si difieren, RE-PLANIFICA sobre el estado
-        percibido y continua. Con `verify_every <= 0` no se verifica
-        durante la ejecucion (solo el chequeo final). Si no hay teclado,
-        solo simula.
+        percibido y continua. Si no hay teclado, solo simula.
 
-        Ademas de la verificacion periodica, hay verificaciones FORZADAS
-        (si config.LEARN_GATES): al pisar un boton cuyo emparejamiento con
-        una reja aun no se ha comprobado (se mira que reja se abrio de
-        verdad y, si no es la que suponia el modelo, se corrige y se
-        re-planifica), y al colarse por la reja contigua a un boton (el
-        fallo del juego; si no funciona se desactiva y se re-planifica).
+        Con `verify_every <= 0` NO se verifica durante la ejecucion:
+        ni la verificacion periodica ni las verificaciones FORZADAS de
+        mas abajo (es el modo "ejecutar el plan entero de corrido", que
+        solo deja el chequeo final). El aprendizaje de rejas en
+        ejecucion (config.LEARN_GATES) tampoco corre, porque depende de
+        esos frames: el mapeo que vale es el declarado en button_gate.py
+        o el de cercania.
+
+        Con `verify_every >= 1` hay, ademas de la periodica, las
+        verificaciones FORZADAS (si config.LEARN_GATES): al pisar un
+        boton cuyo emparejamiento con una reja aun no se ha comprobado
+        (se mira que reja se abrio de verdad y, si no es la que suponia
+        el modelo, se corrige y se re-planifica), y al colarse por la
+        reja contigua a un boton (el fallo del juego; si no funciona se
+        desactiva y se re-planifica).
         """
         plan = plan or self.plan
         if plan is None:
@@ -168,8 +175,12 @@ class Agent:
             index += 1
 
             since_check += 1
+            # verify_every <= 0 silencia TODA verificacion intermedia,
+            # tambien la forzada de botones/fallo (un pantallazo extra en
+            # cada boton pisado romperia el modo "todo de corrido").
             forced = (
                 verify
+                and self.verify_every > 0
                 and config.LEARN_GATES
                 and bool(presses or glitch_step)
             )

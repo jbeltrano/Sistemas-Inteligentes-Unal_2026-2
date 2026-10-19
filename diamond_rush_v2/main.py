@@ -49,7 +49,11 @@ def main() -> None:
         "--verify-every",
         type=int,
         default=None,
-        help="re-percibir cada N pasos (0 = solo al final); por defecto, config.VERIFY_EVERY",
+        help=(
+            "re-percibir cada N pasos; 0 = nada de pantallazos durante la "
+            "ejecucion (ni los periodicos ni los de botones/rejas), solo el "
+            "chequeo final; por defecto, config.VERIFY_EVERY"
+        ),
     )
     parser.add_argument(
         "--level",

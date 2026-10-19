@@ -1053,6 +1053,111 @@ def test_execute_no_envia_teclas_si_el_plan_es_incompleto():
     assert teclado.llamadas == 0
 
 
+class _TecladoEjecutable:
+    """Teclado falso que registra las flechas enviadas (y no falla)."""
+
+    def __init__(self):
+        self.movimientos = []
+
+    def focus(self):
+        pass
+
+    def move(self, direction, pause=None):
+        self.movimientos.append(direction)
+
+
+class _CapturerInexistente:
+    """Capturer falso: cualquier frame es un RuntimeError (personaje no visto)."""
+
+    def locate_canvas(self):
+        pass
+
+    def capture(self):
+        raise RuntimeError("sin personaje en el frame de prueba")
+
+
+def _plan_un_paso(world):
+    """Plan de un solo movimiento a partir de `world` (sin final a validar)."""
+    return Plan(
+        actions=[Action("move", "right")],
+        complete=True,
+        initial_world=world,
+    )
+
+
+def test_verify_every_cero_no_toma_pantallazos(monkeypatch):
+    """
+    Con verify_every=0 NO se toman pantallazos intermedios: tampoco los
+    forzados de botones (verify_every <= 0 silencia toda verificacion,
+    no solo la periodica). Las flechas si se mandan.
+    """
+    import agent
+
+    settle_calls = []
+
+    def _settle_spy(self, prev_cell, expected_cell):
+        settle_calls.append((prev_cell, expected_cell))
+        return None
+
+    monkeypatch.setattr(agent.Agent, "_settle", _settle_spy)
+
+    world = World(rows=1, cols=3, player=(0, 0))
+    teclado = _TecladoEjecutable()
+    agente = agent.Agent(
+        capturer=_CapturerInexistente(),
+        keyboard=teclado,
+        verify_every=0,
+    )
+    plan = Plan(
+        actions=[Action("move", "right"), Action("move", "right")],
+        complete=True,
+        initial_world=world,
+    )
+
+    resultado = agente.execute(plan)
+
+    assert resultado is plan
+    assert teclado.movimientos == ["right", "right"]
+    assert settle_calls == []  # ni periódicos ni forzados de botones
+
+
+def test_verify_every_positivo_si_verifica_botones(monkeypatch):
+    """
+    Con verify_every >= 1 la verificacion FORZADA sigue activa: pisar un
+    boton cuya reja no esta confirmada dispara un pantallazo (_settle).
+    """
+    import agent
+
+    settle_calls = []
+
+    def _settle_spy(self, prev_cell, expected_cell):
+        settle_calls.append((prev_cell, expected_cell))
+        return None
+
+    monkeypatch.setattr(agent.Agent, "_settle", _settle_spy)
+
+    world = World(
+        rows=1,
+        cols=3,
+        player=(0, 0),
+        buttons=frozenset({(0, 1)}),
+        button_gate={(0, 1): (0, 2)},
+        all_gates=frozenset({(0, 2)}),
+    )
+    teclado = _TecladoEjecutable()
+    agente = agent.Agent(
+        capturer=_CapturerInexistente(),
+        keyboard=teclado,
+        verify_every=1,
+    )
+
+    resultado = agente.execute(_plan_un_paso(world))
+
+    assert resultado.complete
+    assert teclado.movimientos == ["right"]
+    assert settle_calls == [((0, 0), (0, 1))]  # el boton pisado se verifico
+
+
 # ---------------------------------------------------------------
 # Pistas de subobjetivos por nivel (level_hints.py)
 # ---------------------------------------------------------------
