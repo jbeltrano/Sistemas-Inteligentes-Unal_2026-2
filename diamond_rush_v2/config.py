@@ -108,3 +108,15 @@ GLITCH_SETTLE = 0.30           # espera antes de colarse, con la reja ya abierta
 # comportamiento de niveles que hoy ya pasan: por eso queda apagado).
 ROCK_MACRO_FIRST = False
 MAX_NODES_MACRO = 150_000      # presupuesto de A* para llevar la roca al boton
+# Presupuesto de nodos para el planificador de EMPUJES (push_planner), que
+# busca a nivel de Sokoban (una accion = un empuje, el caminar es
+# implicito). Cada nodo es mucho mas caro que uno de A* de celdas, pero el
+# espacio es ordenes de magnitud menor; 50k sobra de largo.
+MAX_NODES_PUSH = 50_000
+# Orden de la planificacion. False (por defecto): la CADENA de subobjetivos
+# (hints -> _plan_fallback) es el camino principal y el A* global de 400k
+# nodos queda como ultimo recurso si la cadena deja metas pendientes; con
+# True se conserva el orden viejo (A* global primero, respaldo despues).
+# En niveles complejos el A* global quemaba el presupuesto para fallar
+# igual, por eso el orden nuevo arranca por la composicion dirigida.
+TRY_GLOBAL_ASTAR_FIRST = False

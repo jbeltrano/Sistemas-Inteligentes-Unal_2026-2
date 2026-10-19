@@ -38,8 +38,9 @@ nunca de cv2 ni de recognition.py.
 """
 import heapq
 import itertools
+import time
 from collections import deque
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import (
     Callable,
     Dict,
@@ -174,6 +175,22 @@ class World:
 
     def in_bounds(self, cell: Cell) -> bool:
         return 0 <= cell[0] < self.rows and 0 <= cell[1] < self.cols
+
+
+def _world_with(world: World, **changes) -> World:
+    """
+    Copia rapida de un World cambiando algunos campos.
+
+    Equivalent a `dataclasses.replace` pero sin su maquinaria generica
+    (que recorre y hace getattr de TODOS los campos en cada llamada y
+    dominaba el perfil del buscador: ~58% del tiempo por sucesor). Como
+    `World` es un dataclass congelado sin `__post_init__`, se construye la
+    copia copiando el `__dict__` y aplicando los cambios directamente.
+    """
+    nuevo = object.__new__(World)
+    nuevo.__dict__.update(world.__dict__)
+    nuevo.__dict__.update(changes)
+    return nuevo
 
 
 @dataclass
@@ -560,7 +577,10 @@ def _connected(world: World, origin: Cell, target: Cell) -> bool:
     """Hay un paso directo de piso entre dos celdas: son vecinas en la topologia."""
     if world.adjacency:
         return target in world.adjacency.get(origin, ())
-    return target in set(_grid_neighbors(world, origin))
+    # Fallback sin grafo: `target` siempre llega como `origin + DELTA` (ver
+    # `_step`), asi que basta con que exista como piso. Evita materializar
+    # el generador de vecinos en un set en cada llamada.
+    return world.in_bounds(target) and target not in world.walls
 
 
 # ---------------------------------------------------------------
@@ -574,11 +594,19 @@ def _leave_spike(world: World, origin: Cell) -> World:
     """
     if origin not in world.spikes:
         return world
-    return replace(
+    return _world_with(
         world,
         spikes=frozenset(world.spikes - {origin}),
         walls=frozenset(world.walls | {origin}),
     )
+
+
+def _covered_buttons(world: World) -> FrozenSet[Cell]:
+    """
+    Botones cubiertos en `world` (personaje o roca encima). Se calcula sin
+    construir el mundo recolectado, para el chequeo barato de rejas.
+    """
+    return world.buttons & (world.rocks | {world.player})
 
 
 def _estado_valido(world: World, origin: Optional[Cell] = None) -> bool:
@@ -594,12 +622,16 @@ def _estado_valido(world: World, origin: Optional[Cell] = None) -> bool:
     juego real aunque la reja se cierre al soltar el boton; el personaje
     queda dentro de la reja y sigue de largo (ver button_gate.GATE_GLITCH).
     `origin` es la celda de la que sale el personaje en este paso.
+
+    Solo mira el estado de las rejas (no recolecta diamantes/llaves ni
+    abre puertas): es el chequeo barato que evita un `_collect` extra por
+    sucesor.
     """
-    collected = _collect(world)
-    if collected.player in collected.gates:
-        if origin is None or (origin, collected.player) not in world.glitch:
+    gates = _gates_actuales(world, _covered_buttons(world))
+    if world.player in gates:
+        if origin is None or (origin, world.player) not in world.glitch:
             return False
-    if collected.rocks & collected.gates:
+    if world.rocks & gates:
         return False
     return True
 
@@ -684,13 +716,13 @@ def _step(
         else:
             rocks = frozenset((world.rocks - {target}) | {push})
         nuevo = _leave_spike(
-            replace(world, rocks=rocks, holes=holes, player=target), origin
+            _world_with(world, rocks=rocks, holes=holes, player=target), origin
         )
         if not _estado_valido(nuevo):
             return None
         return Action("push", direction), nuevo
     else:
-        nuevo = _leave_spike(replace(world, player=target), origin)
+        nuevo = _leave_spike(_world_with(world, player=target), origin)
         if not _estado_valido(nuevo, origin):
             return None
         return Action("move", direction), nuevo
@@ -760,7 +792,7 @@ def _collect(world: World) -> World:
     # personaje o si queda una roca encima. Se recalcula CADA paso (no
     # solo los "nuevos") porque la reja es temporal: se cierra al
     # descubrir su boton.
-    covered = world.buttons & (world.rocks | {player})
+    covered = _covered_buttons(world)
     all_gates = world.all_gates | world.gates
     gates = _gates_actuales(world, covered)
     pressed = covered
@@ -779,7 +811,7 @@ def _collect(world: World) -> World:
         and exit_unlocked == world.exit_unlocked
     ):
         return world
-    return replace(
+    return _world_with(
         world,
         diamonds=frozenset(diamonds),
         keys=frozenset(keys),
@@ -1118,6 +1150,8 @@ def a_star(
     allow_rock_on_diamond: bool = True,
     rock_goal: Optional[Cell] = None,
     keep_reachable: FrozenSet[Cell] = frozenset(),
+    field: Optional[Dict[Cell, int]] = None,
+    reverse_field: Optional[Dict[Cell, int]] = None,
 ) -> Optional[Tuple[List[Action], World]]:
     """
     A* ponderado sobre el espacio de mundos completos. Devuelve
@@ -1139,19 +1173,23 @@ def a_star(
     descartan los sucesores que activan un pico y dejan alguna de esas
     celdas aislada (seguridad generica de picos: no cortar el camino a
     otro objetivo con un movimiento irreversible).
+
+    `field` y `reverse_field` permiten pasar campos de distancia ya
+    calculados (los subobjetivos de un mismo `resolve` comparten `world`,
+    `goals` y `rock_goal`, y cada A* los recalculaba). Si se omiten, se
+    calculan aqui.
     """
     reached = success or (lambda w: _reached(w, goals))
     if reached(world):
         return [], _collect(world)
 
-    field = wall_distance_field(world, goals)
+    if field is None:
+        field = wall_distance_field(world, goals)
     if world.player not in field:
         return None
-    reverse = (
-        wall_distance_field(world, {rock_goal})
-        if rock_goal is not None
-        else None
-    )
+    if reverse_field is None and rock_goal is not None:
+        reverse_field = wall_distance_field(world, {rock_goal})
+    reverse = reverse_field
 
     def h_of(state: World) -> float:
         base = field.get(state.player, float("inf"))
@@ -1163,14 +1201,33 @@ def a_star(
         )
         return base + toca
 
-    open_heap: List[Tuple[float, float, int, World, Tuple[Action, ...]]] = []
-    heapq.heappush(open_heap, (weight * h_of(world), 0.0, 0, world, ()))
+    # Ruta por PUNTEROS al padre (no se copia la tupla del plan en cada
+    # push). `worlds[i]` es el mundo del nodo i; la accion y el padre
+    # permiten reconstruir la secuencia al llegar a la meta.
+    worlds: List[World] = [world]
+    node_action: List[Optional[Action]] = [None]
+    node_parent: List[int] = [-1]
+
+    def reconstruct(idx: int) -> List[Action]:
+        seq: List[Action] = []
+        while node_parent[idx] != -1:
+            seq.append(node_action[idx])  # type: ignore[arg-type]
+            idx = node_parent[idx]
+        seq.reverse()
+        return seq
+
+    open_heap: List[Tuple[float, float, int, int]] = []
+    heapq.heappush(open_heap, (weight * h_of(world), 0.0, 0, 0))
     visited: Set[tuple] = set()
+    # Mejor g conocido por estado: descarta pushes a estados que ya tienen
+    # un camino igual o mejor (evita inflar el heap con duplicados).
+    best_g: Dict[tuple, float] = {}
     counter = 1
     nodes = 0
 
     while open_heap and nodes < max_nodes:
-        _f, g, _c, current, plan = heapq.heappop(open_heap)
+        _f, g, _c, idx = heapq.heappop(open_heap)
+        current = worlds[idx]
         key = _state_key(current)
         if key in visited:
             continue
@@ -1178,8 +1235,9 @@ def a_star(
         nodes += 1
 
         if reached(current):
-            return list(plan), current
+            return reconstruct(idx), current
 
+        ng = g + 1
         for action, successor in _successors(
             current,
             allow_spike_activation=allow_spike_activation,
@@ -1187,6 +1245,8 @@ def a_star(
         ):
             state_key = _state_key(successor)
             if state_key in visited:
+                continue
+            if best_g.get(state_key, float("inf")) <= ng:
                 continue
             if (
                 keep_reachable
@@ -1197,10 +1257,13 @@ def a_star(
             h = h_of(successor)
             if h == float("inf"):
                 continue
+            best_g[state_key] = ng
+            worlds.append(successor)
+            node_action.append(action)
+            node_parent.append(idx)
             counter += 1
             heapq.heappush(
-                open_heap,
-                (g + 1 + weight * h, g + 1, counter, successor, plan + (action,)),
+                open_heap, (ng + weight * h, ng, counter, len(worlds) - 1)
             )
 
     return None
@@ -1233,12 +1296,27 @@ def backtracking_search(
     if reached(world):
         return [], _collect(world)
 
+    # Ruta por PUNTEROS al padre (no se copia la tupla del plan en cada
+    # push). La pila solo guarda indices de nodo y profundidad.
+    worlds: List[World] = [world]
+    node_action: List[Optional[Action]] = [None]
+    node_parent: List[int] = [-1]
+
+    def reconstruct(idx: int) -> List[Action]:
+        seq: List[Action] = []
+        while node_parent[idx] != -1:
+            seq.append(node_action[idx])  # type: ignore[arg-type]
+            idx = node_parent[idx]
+        seq.reverse()
+        return seq
+
     visited: Set[tuple] = set()
-    stack: List[Tuple[World, Tuple[Action, ...], int]] = [(world, (), 0)]
+    stack: List[Tuple[int, int]] = [(0, 0)]
     nodes = 0
 
     while stack and nodes < max_nodes:
-        current, plan, depth = stack.pop()
+        idx, depth = stack.pop()
+        current = worlds[idx]
         key = _state_key(current)
         if key in visited:
             continue
@@ -1247,18 +1325,21 @@ def backtracking_search(
         if depth >= max_depth:
             continue
         if reached(current):
-            return list(plan), current
+            return reconstruct(idx), current
 
-        # Empujes primero: es lo que desbloquea el camino bloqueado.
-        successors = sorted(
+        # Empujes al final de la lista de expansion (quedan abajo en la
+        # pila): es lo que desbloquea el camino. Construccion estable sin
+        # `sorted` (que ordenaba en cada nodo).
+        successors = list(
             _successors(
                 current,
                 allow_spike_activation=allow_spike_activation,
                 allow_rock_on_diamond=allow_rock_on_diamond,
-            ),
-            key=lambda s: s[0].kind != "push",
+            )
         )
-        for action, successor in reversed(successors):
+        ordered = [s for s in successors if s[0].kind != "push"]
+        ordered += [s for s in successors if s[0].kind == "push"]
+        for action, successor in reversed(ordered):
             if _state_key(successor) in visited:
                 continue
             if (
@@ -1267,7 +1348,10 @@ def backtracking_search(
                 and not keep_reachable <= _reachable_bare(successor)
             ):
                 continue
-            stack.append((successor, plan + (action,), depth + 1))
+            worlds.append(successor)
+            node_action.append(action)
+            node_parent.append(idx)
+            stack.append((len(worlds) - 1, depth + 1))
 
     return None
 
@@ -1428,6 +1512,50 @@ def _hint_rock_goal(world: World, name: str) -> Optional[Cell]:
     return None
 
 
+def _push_target(
+    world: World,
+    name: str,
+    goals: FrozenSet[Cell],
+    success: Callable[[World], bool],
+) -> Optional[Cell]:
+    """
+    Celda objetivo de la roca para el planificador de empujes, o None si
+    el subobjetivo no se resuelve "poniendo una roca" en una celda.
+
+    Aplica a:
+
+    - `hoyo X`: la roca debe cubrir literalmente X.
+    - `roca X`: el destino ya es X (waypoint de pista).
+    - `boton X` temporal: la unica forma util es una roca encima (el
+      predicado de exito del boton temporal es exactamente ese).
+
+    Para el resto (llaves, puertas, diamantes, salida, pistas que ya
+    traen `rock_goal`) no aplica aqui: su empuje lo guia el A* de celdas
+    con `rock_goal`, o el propio exito no es una roca en una celda.
+
+    Se valida el destino probando `success` sobre un mundo con una roca
+    hipotetica en esa celda: si no lo satisface, no es un objetivo de
+    empuje valido (evita forzar el push_planner a metas equivocadas).
+    """
+    if name.startswith("hoyo"):
+        target = next(iter(goals), None)
+    elif name.startswith("roca"):
+        target = next(iter(goals), None)
+    elif name.startswith("boton"):
+        target = next(iter(goals), None)
+    else:
+        return None
+    if target is None:
+        return None
+    prueba = _world_with(world, rocks=frozenset(world.rocks | {target}))
+    if target in world.holes:
+        prueba = _world_with(prueba, holes=frozenset(world.holes - {target}))
+    if not success(prueba):
+        return None
+    return target
+
+
+
 def _reachable_avoiding_holes(world: World, target: Cell) -> bool:
     """True si `target` es alcanzable sin pisar ningun hoyo."""
     visited: Set[Cell] = {world.player}
@@ -1505,12 +1633,32 @@ class Planner:
         # El mundo del planificador arranca tras recolectar lo que el
         # personaje ya pisa (y desbloqueando la salida si no hay gemas).
         current = _collect(world)
-        # Con pistas por nivel (level_hints), el camino principal es la
-        # composicion dirigida: un A* por subobjetivo en el orden
-        # declarado, en vez del A* global (que en el nivel 6 se queda sin
-        # presupuesto y en el 10 no converge). Si TODAS las pistas ya
-        # estan cumplidas (nivel a medias), se sigue con la busqueda
-        # global normal para el resto.
+        # Orden nuevo (config.TRY_GLOBAL_ASTAR_FIRST=False): la CADENA de
+        # subobjetivos es el camino principal y el A* global queda como
+        # ultimo recurso. En niveles complejos el A* global quemaba su
+        # presupuesto de 400k nodos para fallar igual (nivel 6, 10), asi
+        # que se arranca por la composicion dirigida (que ahora incluye el
+        # planificador de empujes para los hoyos/botones).
+        if not config.TRY_GLOBAL_ASTAR_FIRST:
+            chain = self._plan_fallback(world)
+            if chain.complete:
+                return chain
+            # La cadena dejo metas pendientes: ultimo recurso, el A* global
+            # con el nivel completo (por si una vision global cabe ahora).
+            base = self._solve(world, current, [])
+            if base is not None and base.complete:
+                return base
+            # Ninguno completo: se queda el que resuelva mas (menos metas
+            # pendientes) y, a igualdad, el mas corto.
+            if base is not None and len(base.pending) <= len(chain.pending):
+                return base
+            return chain
+        # Orden viejo: A* global primero, respaldo (incluye pistas) despues.
+        # Con pistas por nivel, el camino principal es la composicion
+        # dirigida: un A* por subobjetivo en el orden declarado, en vez del
+        # A* global (que en el nivel 6 se queda sin presupuesto y en el 10
+        # no converge). Si TODAS las pistas ya estan cumplidas (nivel a
+        # medias), se sigue con la busqueda global normal para el resto.
         if any(
             not any(s(current) for s in _successes_for(name, goals, current))
             for name, goals, _rock in current.hints
@@ -1540,6 +1688,8 @@ class Planner:
         cuando el comportamiento original era caer en _plan_fallback.
         """
         actions = list(actions)
+        from computation.push_planner import push_a_star as _push_a_star
+
         if current.diamonds:
             result = a_star(
                 current,
@@ -1557,6 +1707,17 @@ class Planner:
             exit_cell = current.exit
             goals = frozenset({exit_cell})
             result = a_star(current, goals, self.max_nodes_astar)
+            if result is None and current.rocks:
+                # Salida bloqueada por rocas (p. ej. nivel 20): el A* de
+                # celdas no compone empujes. Se prueba el planificador de
+                # empujes con meta "el personaje alcanza la salida".
+                push = _push_a_star(
+                    current,
+                    exit_cell,
+                    goal_player_reaches=True,
+                )
+                if push is not None:
+                    result = push
             if result is None:
                 # Mismo respaldo que el resolve del fallback: puzzles de
                 # salida con rocas necesitan el retroceso (p. ej. nivel 20).
@@ -1666,6 +1827,39 @@ class Planner:
                 and goals not in done_hints
             )
 
+        def _push_para_subobjetivo(
+            world_actual: World,
+            name: str,
+            goals: FrozenSet[Cell],
+            success: Callable[[World], bool],
+        ) -> Optional[Tuple[List[Action], World]]:
+            """
+            Intenta resolver el subobjetivo con el planificador de empujes
+            (push_planner). Aplica a metas cuyo exito se logra con una roca
+            encima: hoyos, botones temporales y waypoints de roca. El
+            `success` del subobjetivo decide si el destino es justo la
+            celda meta; `_push_target` valida el destino.
+            """
+            target = _push_target(current, name, goals, success)
+            if target is None:
+                return None
+            # Import local: push_planner importa de este modulo (World,
+            # Action, la topologia), asi que el import a nivel de modulo
+            # seria circular.
+            from computation.push_planner import push_a_star
+
+            result = push_a_star(world_actual, target, config.MAX_NODES_PUSH)
+            if result is None:
+                return None
+            # El mundo final del push_planner es coherente con el del A*:
+            # se le aplica _collect para que la cadena de subobjetivos vea
+            # el mismo estado (los empujes no tocan diamantes/llaves/salida,
+            # pero una roca sobre un boton si cambia `pressed`).
+            result = result[0], _collect(result[1])
+            if not success(result[1]):
+                return None
+            return result
+
         def resolve(
             name: str,
             goals: FrozenSet[Cell],
@@ -1717,11 +1911,34 @@ class Planner:
             # (una roca al hoyo/boton/celda); si no, el primer predicado
             # de un boton temporal usa el propio boton como destino.
             hint_rock = _hint_rock_goal(current, name)
+            # `current`, `goals` y `keep_reachable` no cambian entre modos:
+            # el campo de distancias y el inverso (rock_goal) se calculan
+            # UNA vez y se reusan en cada A* (antes se recalculaban por
+            # combinacion modo x predicado).
+            field_cache = wall_distance_field(current, goals)
+            reverse_cache: Dict[Cell, Dict[Cell, int]] = {}
             for indice, success in enumerate(success_preds):
                 rock_goal = hint_rock
                 if rock_goal is None and name.startswith("boton") and indice == 0:
                     rock_goal = next(iter(goals), None)
+                reverse_field = None
+                if rock_goal is not None:
+                    reverse_field = reverse_cache.get(rock_goal)
+                    if reverse_field is None:
+                        reverse_field = wall_distance_field(current, {rock_goal})
+                        reverse_cache[rock_goal] = reverse_field
                 for spikes, rocks in modes:
+                    # Planificador de EMPUJES primero (solo en modo seguro):
+                    # para un subobjetivo cuyo exito es "roca sobre la celda
+                    # X" (hoyo/boton/waypoint de roca) busca a nivel Sokoban
+                    # y evita el arbol de caminatas del A* de celdas. Si no
+                    # aplica o no encuentra, se sigue con A*/retroceso.
+                    if not spikes and not rocks:
+                        result = _push_para_subobjetivo(
+                            current, name, goals, success
+                        )
+                        if result is not None:
+                            return result
                     result = a_star(
                         current,
                         goals,
@@ -1731,6 +1948,8 @@ class Planner:
                         allow_rock_on_diamond=rocks,
                         rock_goal=rock_goal,
                         keep_reachable=keep_reachable,
+                        field=field_cache,
+                        reverse_field=reverse_field,
                     )
                     if result is None:
                         result = backtracking_search(
@@ -1797,12 +2016,15 @@ class Planner:
                 else self.max_nodes_astar
             )
             previous = current
+            _t0 = time.time()
             result = resolve(name, goals, budget, solo_seguro=bool(blockers))
+            _dt = round(time.time() - _t0, 2)
             print(
                 f"[trace] pop={name} blockers={blockers} budget={budget} "
                 f"seguro={bool(blockers)} player={current.player} "
                 f"has_key={current.has_key} doors={sorted(current.doors)} "
                 f"-> {'OK ' + str(len(result[0])) if result else 'FALLA'}"
+                f" ({_dt}s)"
             )
             if result is None:
                 new_blockers = [
