@@ -23,9 +23,10 @@ python diamond_rush_v2/main.py --debug            # imprime el GameState complet
 python diamond_rush_v2/main.py --verify-every 1   # re-percibe cada paso; 0 = solo al final;
                                                   # por defecto: cada 10 (config.VERIFY_EVERY)
 python diamond_rush_v2/main.py --level 6          # nivel actual; activa el mapeo botón→reja
-                                                  # de button_gate.py (varios pares)
+                                                  # de button_gate.py (varios pares) y las
+                                                  # pistas de subobjetivos de level_hints.py
 
-# Tests: solo pytest, sin navegador (~32 tests, ~2 min). Sirve desde
+# Tests: solo pytest, sin navegador (~36 tests, ~2 min). Sirve desde
 # diamond_rush_v2/ o desde la raíz (tests/conftest.py mete la raíz del
 # proyecto en sys.path)
 pytest
@@ -50,9 +51,9 @@ Abrir `https://www.minijuegos.com/embed/diamond-rush`, pasar el tutorial a mano 
 `GameState` (`perception/state.py`) es el **único** contrato entre percepción y el resto. Regla: `computation/` y `play/` importan **solo** de `perception.state` y `config`, nunca de `cv2` ni de `recognition.py` (verificado por grep; `agent.py` es el único que cierra el lazo). **Leer `perception/README.md` antes de tocar percepción ni planificación**: documenta campo por campo el contrato, cómo se usa en A\* y las limitaciones conocidas.
 
 - `perception/` — captura (Selenium sobre el canvas) y reconocimiento (templates + máscara HSV de suelo). Produce un `GameState` por frame.
-- `computation/` — modelo (`World`) y planificación: A* ponderado (`A_STAR_WEIGHT = 2.0`) sobre el espacio de mundos, con `backtracking_search` (DFS) de respaldo si A* se queda sin presupuesto. Planifica en fases: **búsqueda global de recolección** (todos los diamantes en un solo A*; llaves/rejas/botones instrumentales) → salida; si la global revienta el presupuesto, `_plan_fallback` compone subobjetivos (llaves → botones → diamantes → salida). Presupuestos y pesos en `config.py`. Las rejas son **temporales** (abiertas solo mientras su botón esté cubierto por el personaje o una roca): el emparejamiento botón→reja es 1:1 y, con varios pares, se declara por nivel en `button_gate.py` (se pasa con `--level N`; lo no declarado se empareja por cercanía).
+- `computation/` — modelo (`World`) y planificación: A* ponderado (`A_STAR_WEIGHT = 2.0`) sobre el espacio de mundos, con `backtracking_search` (DFS) de respaldo si A* se queda sin presupuesto. Planifica en fases: **búsqueda global de recolección** (todos los diamantes en un solo A*; llaves/rejas/botones instrumentales) → salida; si la global revienta el presupuesto, `_plan_fallback` compone subobjetivos (llaves → botones → diamantes → salida). Presupuestos y pesos en `config.py`. Para niveles que la búsqueda global no resuelve (6 lento, 10 hoy) se pueden declarar **pistas de subobjetivos** en `level_hints.py` (misma opción `--level N`): una secuencia ordenada que el fallback persigue primero (una pista por A\*, con waypoints de roca encadenables) y luego completa el resto automáticamente; son preferencias revalidadas contra lo percibido, no un guion. Las rejas son **temporales** (abiertas solo mientras su botón esté cubierto por el personaje o una roca): el emparejamiento botón→reja es 1:1 y, con varios pares, se declara por nivel en `button_gate.py` (se pasa con `--level N`; lo no declarado se empareja por cercanía). Para rejas temporales **instrumentales** (tapan una meta pendiente) el subobjetivo `boton` solo acepta **una roca encima**, nunca al personaje (pisar y salir la cierra): era un falso éxito que ciclaba el fallback. A* admite además `rock_goal` (heurística rock-aware para empujes Sokoban) y `keep_reachable` (seguridad de picos: no permite activar un pico que aísle una meta pendiente). **Limitación conocida:** el nivel 11 necesita un Sokoban de **dos rocas por la columna 7** (una rellena el hoyo (5,7) y se consume, otra llega al botón (3,7)); el fallback, que resuelve un subobjetivo por A*, no lo compone y el plan queda incompleto.
 - `play/` — control: cada dirección es una flecha enviada al canvas en **una sola** `ActionChains.perform()` (key_down → pausa → key_up). Dos `perform()` separados = dos casillas de movimiento (bug ya corregido, ver docstring de `Keyboard.press`).
-- `agent.py` — cierra el lazo: ejecuta el plan y, cada `VERIFY_EVERY` pasos, re-percibe con "settle" (`_settle`: espera a que la celda del personaje se asiente) y re-planifica si hay desvío (tope `MAX_REPLANS = 50`).
+- `agent.py` — cierra el lazo: ejecuta el plan y, cada `VERIFY_EVERY` pasos, re-percibe con "settle" (`_settle`: espera a que la celda del personaje se asiente) y re-planifica si hay desvío (tope `MAX_REPLANS = 50`). Si el plan queda **incompleto** no se ejecuta: imprime las metas pendientes y se detiene sin mandar teclas (ejecutarlo dejaría el nivel peor sin resolverlo).
 
 ## Depuración de percepción
 
