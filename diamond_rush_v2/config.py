@@ -89,3 +89,22 @@ MAX_REPLANS = 100              # tope de re-planificaciones seguidas antes de ab
 # que hubo desvío (lo que reenviaría la misma flecha = doble movimiento).
 SETTLE_TIMEOUT = 1.0           # tiempo máximo de espera del asentado (segundos)
 SETTLE_POLL = 0.05             # pausa entre lecturas del asentado (segundos)
+
+# ---------------------------------------------------------------
+# Botones, rejas y el fallo del juego
+# ---------------------------------------------------------------
+# Aprender que reja abre cada boton mirando el frame al pisarlo (y
+# re-planificar si no es la que el modelo suponia).
+LEARN_GATES = True
+GATE_SETTLE = 0.30             # espera tras pisar un boton, para que la reja termine de animarse (s)
+# Fallo del juego: desde un boton, entrar a la reja contigua mientras esta
+# abierta evita tener que dejar una roca encima. Solo se usa en los niveles
+# declarados en button_gate.GATE_GLITCH; si falla en ejecucion se desactiva.
+USE_GLITCH = True
+GLITCH_SETTLE = 0.30           # espera antes de colarse, con la reja ya abierta (s)
+# Macro "roca sobre el boton" para niveles con UN solo boton: si el A*
+# global no encuentra plan, primero se intenta dejar una roca en el boton.
+# Con ROCK_MACRO_FIRST=True se intenta ANTES del A* global (cambia el
+# comportamiento de niveles que hoy ya pasan: por eso queda apagado).
+ROCK_MACRO_FIRST = False
+MAX_NODES_MACRO = 150_000      # presupuesto de A* para llevar la roca al boton

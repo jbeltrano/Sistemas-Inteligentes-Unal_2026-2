@@ -19,6 +19,7 @@ import cv2
 
 import config
 from computation.compute import Plan, Planner, World, simulate, world_from_state
+from computation.gates import GateKnowledge
 from perception.capture import BrowserCapturer
 from perception.recognition import recognize
 from perception.state import GameState
@@ -51,6 +52,10 @@ class Agent:
         # Nivel actual (1..20) para el mapeo explicito boton->reja de
         # button_gate.py; None = heuristica por cercania.
         self.level = level
+        # Memoria de botones/rejas del nivel: lo estatico (que un frame
+        # suelto pierde al estar cubierto/abierto) y lo aprendido al pisar
+        # botones. Vive lo que dura el Agent, es decir, un nivel.
+        self.knowledge = GateKnowledge(level=level)
 
         self.state: Optional[GameState] = None
         self.world: Optional[World] = None
@@ -72,6 +77,7 @@ class Agent:
             raise
 
         self.state = state
+        self.knowledge.remember(state)  # solo el primer frame siembra la memoria
         if self.print_state:
             self._print_state(state)
         return state
@@ -87,7 +93,9 @@ class Agent:
         """
         if self.state is None:
             self.perceive()
-        self.world = world_from_state(self.state, level=self.level)
+        self.world = world_from_state(
+            self.state, level=self.level, knowledge=self.knowledge
+        )
         self.plan = self.planner.plan(self.world)
         return self.plan
 
@@ -107,6 +115,13 @@ class Agent:
         percibido y continua. Con `verify_every <= 0` no se verifica
         durante la ejecucion (solo el chequeo final). Si no hay teclado,
         solo simula.
+
+        Ademas de la verificacion periodica, hay verificaciones FORZADAS
+        (si config.LEARN_GATES): al pisar un boton cuyo emparejamiento con
+        una reja aun no se ha comprobado (se mira que reja se abrio de
+        verdad y, si no es la que suponia el modelo, se corrige y se
+        re-planifica), y al colarse por la reja contigua a un boton (el
+        fallo del juego; si no funciona se desactiva y se re-planifica).
         """
         plan = plan or self.plan
         if plan is None:
@@ -119,45 +134,80 @@ class Agent:
             return plan
 
         self.keyboard.focus()
+        # Mundo esperado tras cada accion: se calcula UNA vez por plan (antes
+        # se recalculaba entero en cada paso, O(n^2) en planes largos).
+        worlds = self._expected_worlds(plan)
         index = 0
         replans = 0
         since_check = 0
         while index < plan.length:
-            expected_cells = self._expected_cells(plan)
             action = plan.actions[index]
-            prev_cell = (
-                plan.initial_world.player
-                if index == 0
-                else expected_cells[index - 1]
+            before = plan.initial_world if index == 0 else worlds[index - 1]
+            after = worlds[index]
+            prev_cell, expected_cell = before.player, after.player
+            presses = self._unconfirmed_presses(before, after)
+            glitch_step = (
+                (prev_cell, expected_cell) in before.glitch
+                and prev_cell not in self.knowledge.glitch_confirmed
             )
-            expected_cell = expected_cells[index]
             print(f"[{index + 1:>4}/{plan.length}] {action.text()}")
+            if (prev_cell, expected_cell) in before.glitch:
+                # Con la reja ya abierta del todo, para que el fallo aplique.
+                time.sleep(config.GLITCH_SETTLE)
             self.keyboard.move(action.direction, pause=pause)
             index += 1
 
             since_check += 1
-            if (
-                not verify
-                or self.verify_every <= 0
-                or since_check < self.verify_every
-            ):
+            forced = (
+                verify
+                and config.LEARN_GATES
+                and bool(presses or glitch_step)
+            )
+            periodic = (
+                verify
+                and self.verify_every > 0
+                and since_check >= self.verify_every
+            )
+            if not (forced or periodic):
                 continue
             since_check = 0
+
+            before_state = self.state  # ultimo frame previo a este paso
+            if presses:
+                time.sleep(config.GATE_SETTLE)  # que la reja termine de animarse
             state = self._settle(prev_cell, expected_cell)
-            if state is None or state.player_cell == expected_cell:
+            if state is None:
                 continue
 
-            print(
-                f"PROGRESO INESPERADO: personaje en {state.player_cell}, "
-                f"se esperaba {expected_cell}. Re-planifico."
-            )
+            gate_mismatch = self._learn_gates(before, presses, before_state, state)
+            off_course = state.player_cell != expected_cell
+            if glitch_step:
+                if off_course:
+                    print(
+                        f"El fallo del juego no funciono en {prev_cell}->"
+                        f"{expected_cell}: se desactiva y se re-planifica."
+                    )
+                    self.knowledge.disable_glitch(prev_cell)
+                else:
+                    self.knowledge.glitch_confirmed.add(prev_cell)
+            if not off_course and not gate_mismatch:
+                continue
+
+            if off_course and not glitch_step:
+                print(
+                    f"PROGRESO INESPERADO: personaje en {state.player_cell}, "
+                    f"se esperaba {expected_cell}. Re-planifico."
+                )
             replans += 1
             if replans > config.MAX_REPLANS:
                 print("Demasiadas re-planificaciones seguidas; se aborta.")
                 break
-            self.world = world_from_state(state, level=self.level)
+            self.world = world_from_state(
+                state, level=self.level, knowledge=self.knowledge
+            )
             plan = self.planner.plan(self.world)
             self.plan = plan
+            worlds = self._expected_worlds(plan)
             index = 0
             since_check = 0
 
@@ -178,16 +228,54 @@ class Agent:
     # ---------------------------------------------------------------
     # Apoyo
     # ---------------------------------------------------------------
-    def _expected_cells(self, plan: Plan) -> List[tuple]:
-        """Celda esperada del personaje tras cada accion del plan."""
-        cells = []
+    def _expected_worlds(self, plan: Plan) -> List[World]:
+        """Mundo esperado tras cada accion del plan (el de la accion i en [i])."""
+        worlds: List[World] = []
         current = plan.initial_world
         if current is None:
-            return cells
+            return worlds
         for action in plan.actions:
             current = simulate(current, [action])
-            cells.append(current.player)
-        return cells
+            worlds.append(current)
+        return worlds
+
+    def _unconfirmed_presses(self, before: World, after: World) -> List[tuple]:
+        """Botones que este paso cubre por primera vez y cuya reja aun no se verifico."""
+        return [
+            button
+            for button in sorted(after.pressed - before.pressed)
+            if button not in self.knowledge.confirmed
+        ]
+
+    def _learn_gates(
+        self,
+        world: World,
+        presses: List[tuple],
+        before_state: Optional[GameState],
+        after_state: GameState,
+    ) -> bool:
+        """
+        Compara, para cada boton recien pisado, la reja que el modelo
+        predecia con la que se abrio de verdad (frame antes vs despues).
+        Devuelve True si alguna no coincide (el mapeo aprendido ya quedo
+        guardado en self.knowledge; hay que re-planificar).
+        """
+        if before_state is None:
+            return False
+        mismatch = False
+        for button in presses:
+            observed = self.knowledge.observe_press(before_state, after_state, button)
+            if observed is None:
+                continue  # sin evidencia clara: no se aprende ni se confirma
+            predicted = world.button_gate.get(button)
+            self.knowledge.confirmed.add(button)
+            if observed != predicted:
+                print(
+                    f"EMPAREJAMIENTO CORREGIDO: el boton {button} abre la reja "
+                    f"{observed}, no {predicted}. Re-planifico."
+                )
+                mismatch = True
+        return mismatch
 
     def _verify_simulation(self, plan: Plan) -> None:
         """Rejuego del plan sobre el modelo: si no reproduce el final, hay bug."""
