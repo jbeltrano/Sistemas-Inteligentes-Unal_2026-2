@@ -65,6 +65,13 @@ class GameState:
     origin_x: int
     origin_y: int
     tile_size: int
+    # El personaje lleva llave en la mano (variante `player_key` de su
+    # sprite). Lo decide `recognize` comparando player.png contra
+    # player_key.png sobre la region del jugador; computation lo usa para
+    # `World.has_key` y para descartar la llave "fantasma" que el sprite
+    # en la mano genera como si fuera una llave suelta (ver
+    # world_from_state). Si no se puede determinar queda en False.
+    player_has_key: bool = False
 
     def objects_named(self, name: str) -> List[DetectedObject]:
         """Atajo para filtrar detecciones por tipo, ej. "diamond"."""

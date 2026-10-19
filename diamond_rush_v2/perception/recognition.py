@@ -270,6 +270,45 @@ def _load_matchers(frame: np.ndarray) -> List[TemplateMatcher]:
     return matchers
 
 
+def _best_score(frame: np.ndarray, template: np.ndarray) -> float:
+    """Mejor score de un template dentro del frame dado (None = no aplica)."""
+    if (
+        frame.size == 0
+        or template.shape[0] > frame.shape[0]
+        or template.shape[1] > frame.shape[1]
+    ):
+        return -1.0
+    result = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
+    return float(result.max())
+
+
+def _player_has_key(frame: np.ndarray, player: DetectedObject) -> bool:
+    """
+    True si el sprite del personaje corresponde a la variante CON llave
+    en la mano (player_key.png) en vez de la normal (player.png).
+
+    Se compara el mejor score de cada template sobre UNA region del frame
+    centrada en la deteccion del jugador, expandida para que entre el
+    template mas grande de los dos. Es deliberadamente local: no compite
+    con otros templates (una llave suelta, un roca, etc.), solo decide
+    que variante del personaje se ve en su propia celda.
+    """
+    plain = cv2.imread(str(config.TEMPLATES_DIR / "player.png"))
+    with_key = cv2.imread(str(config.TEMPLATES_DIR / "player_key.png"))
+    if plain is None or with_key is None:
+        return False
+
+    height = max(player.height, plain.shape[0], with_key.shape[0])
+    width = max(player.width, plain.shape[1], with_key.shape[1])
+    y0 = max(0, player.y - (height - player.height) // 2)
+    x0 = max(0, player.x - (width - player.width) // 2)
+    y1 = min(frame.shape[0], y0 + height)
+    x1 = min(frame.shape[1], x0 + width)
+
+    region = frame[y0:y1, x0:x1]
+    return _best_score(region, with_key) > _best_score(region, plain)
+
+
 def recognize(frame: np.ndarray) -> GameState:
     """
     Punto de entrada del módulo: corre todo el pipeline de
@@ -305,6 +344,10 @@ def recognize(frame: np.ndarray) -> GameState:
 
     player_box = player_matches[0]
     player_center = player_box.center
+    # Si el personaje trae una llave en la mano, su sprite es el de la
+    # variante player_key. Se decide aqui, sobre su propia region, antes
+    # de mezclarlo con el resto de detecciones.
+    player_has_key = _player_has_key(frame, player_box)
 
     other_detections = _resolve_overlaps(other_candidates, config.MAX_OVERLAP)
     detections = [player_box] + other_detections
@@ -364,4 +407,5 @@ def recognize(frame: np.ndarray) -> GameState:
         origin_x=origin_x,
         origin_y=origin_y,
         tile_size=tile_size,
+        player_has_key=player_has_key,
     )

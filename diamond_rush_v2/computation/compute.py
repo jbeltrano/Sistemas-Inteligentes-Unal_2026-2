@@ -110,7 +110,11 @@ class World:
     - `keys`: llaves sueltas por recoger.
     - `has_key`: el personaje lleva una llave (habilita `doors`). Lleva
       como maximo UNA: abrir una puerta la consume (vuelve a `False`) y
-      pisar otra llave mientras se lleva una no la recoge.
+      pisar otra llave mientras se lleva una no la recoge. En
+      `world_from_state` se fija con la variante del sprite del
+      personaje (`GameState.player_has_key`: el jugador con llave en la
+      mano usa el template `player_key.png`) y, si no se puede determinar,
+      se infiere por conteo (mas puertas cerradas que llaves sueltas).
     - `exit`: celda de la salida (escape/totem); bloquea hasta que no
       queden diamantes (`exit_unlocked`).
     - `exit_unlocked`: la salida ya es transitable (0 diamantes).
@@ -292,6 +296,23 @@ def world_from_state(
         elif role == "exit":
             exit_cell = cell
 
+    # Una llave en la mano del personaje se pinta dentro de su propio
+    # sprite, asi que el template matching la detecta tambien como una
+    # llave SUELTA montada encima de el. Esa deteccion no es una llave
+    # del nivel: contarla duplicaria el inventario y anularia has_key
+    # (ver mas abajo). Se descarta solo la que cae dentro de la caja del
+    # personaje y solo si la percepcion confirmo que trae llave; una
+    # llave suelta real en otra celda (incluso pisada) se conserva.
+    if state.player_has_key:
+        player = next((obj for obj in state.objects if obj.name == "player"), None)
+        if player is not None:
+            px0, py0 = player.x, player.y
+            px1, py1 = px0 + player.width, py0 + player.height
+            for obj in state.objects_named("key"):
+                x, y = obj.center
+                if px0 <= x < px1 and py0 <= y < py1:
+                    keys.discard(state.cell_of(obj.center))
+
     learned: Dict[Cell, Cell] = {}
     glitch: FrozenSet[Tuple[Cell, Cell]] = frozenset()
     if knowledge is not None:
@@ -323,12 +344,18 @@ def world_from_state(
         hints=_hints_from_level(level, grid, holes, buttons, keys, doors, diamonds),
         doors=frozenset(doors),
         keys=frozenset(keys),
-        # Capacidad 1 + consumo: como el nivel tiene igual numero de
-        # llaves y puertas (K0 == D0), si quedan mas puertas cerradas que
-        # llaves en el piso, la que falta la lleva el personaje. Esto
-        # reconstruye has_key en cualquier re-plan sin mirar la mano del
-        # personaje (ver _collect).
-        has_key=(len(doors) - len(keys) == 1),
+        # Llave en la mano del personaje. La senal visual manda: si la
+        # percepcion confirmo el sprite con llave (state.player_has_key),
+        # el personaje la lleva aunque el conteo no lo sugiera (p. ej. el
+        # tester la cogio a mano antes de correr el agente, con la llave
+        # del nivel ya recogida). El conteo es el respaldo para los casos
+        # en que la variante del sprite no se puede determinar (fixtures
+        # de test, re-percepciones borrosas): como el nivel arranca con
+        # igual numero de llaves y puertas (K0 == D0), si quedan mas
+        # puertas cerradas que llaves en el piso, la que falta la lleva el
+        # personaje. Esto reconstruye has_key en cualquier re-plan sin
+        # mirar la mano del personaje (ver _collect).
+        has_key=(state.player_has_key or (len(doors) - len(keys) == 1)),
         exit=exit_cell,
         exit_unlocked=False,
         nodes=frozenset(state.graph_nodes),

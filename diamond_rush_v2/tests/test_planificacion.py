@@ -1281,3 +1281,124 @@ def test_hint_cumplida_no_bloquea_keep_reachable():
 
     assert plan.complete, plan.pending
     assert not simulate(world, plan.actions).diamonds
+
+
+# ---------------------------------------------------------------
+# Llave en la mano del personaje (variante player_key del sprite)
+# ---------------------------------------------------------------
+# Si el tester coge la llave a mano antes de correr el agente, el sprite
+# del personaje cambia a player_key.png y la llave pintada dentro de el
+# matchea TAMBIEN el template de la llave suelta. Sin player_has_key,
+# world_from_state contaba esa deteccion como llave del nivel y has_key
+# quedaba en False: el planificador creia que el personaje no tenia
+# llave y el plan salia incompleto.
+
+
+def _frame_suelo(color_bgr):
+    """Frame 724x1080 (tablero 15x10, tile=72) relleno de suelo macizo."""
+    return np.full((1080, 724, 3), color_bgr, dtype=np.uint8)
+
+
+def _pegar(frame, template, cell):
+    """Pega `template` (numpy BGR) centrado en `cell` (fila, col)."""
+    tile = 72
+    origin_x = (frame.shape[1] - tile * 10) // 2
+    origin_y = (frame.shape[0] - tile * 15) // 2
+    i, j = cell
+    x = origin_x + j * tile + (tile - template.shape[1]) // 2
+    y = origin_y + i * tile + (tile - template.shape[0]) // 2
+    h, w = template.shape[:2]
+    frame[y : y + h, x : x + w] = template
+
+
+def _color_suelo_de_template(path):
+    """Color de fondo (esquina) del template, para igualar el del frame."""
+    import cv2
+
+    image = cv2.imread(str(path))
+    return tuple(int(v) for v in image[0, 0])
+
+
+def test_player_key_marca_player_has_key():
+    """Con el sprite de la variante con llave, player_has_key queda True."""
+    cv2 = pytest.importorskip("cv2")
+    import config
+    from perception.recognition import recognize
+
+    templates = config.TEMPLATES_DIR
+    frame = _frame_suelo(_color_suelo_de_template(templates / "player_key.png"))
+    _pegar(frame, cv2.imread(str(templates / "player_key.png")), (5, 2))
+
+    state = recognize(frame)
+
+    assert state.player_cell == (5, 2)
+    assert state.player_has_key is True
+
+
+def test_player_sin_llave_no_marca_player_has_key():
+    """Con el sprite normal, player_has_key queda False."""
+    cv2 = pytest.importorskip("cv2")
+    import config
+    from perception.recognition import recognize
+
+    templates = config.TEMPLATES_DIR
+    frame = _frame_suelo(_color_suelo_de_template(templates / "player.png"))
+    _pegar(frame, cv2.imread(str(templates / "player.png")), (5, 2))
+
+    state = recognize(frame)
+
+    assert state.player_cell == (5, 2)
+    assert state.player_has_key is False
+
+
+def test_world_has_key_desde_sprite_y_descarta_llave_fantasma():
+    """
+    El sprite con llave manda: has_key es True aunque el conteo no lo
+    sugiera, y la deteccion `key` montada sobre el personaje se descarta
+    de `world.keys` (era la llave de la mano, no una suelta).
+    """
+    grid = np.ones((3, 3), dtype=np.uint8)
+    jugador = DetectedObject("player", 0, 0, 2, 2)   # caja (0,0)-(2,2)
+    llave_en_mano = DetectedObject("key", 0, 0, 1, 1)  # centro (0,0): dentro
+    state = GameState(
+        grid=grid,
+        graph_nodes=set(),
+        adjacency={},
+        player_cell=(0, 0),
+        objects=[jugador, llave_en_mano],
+        objects_by_cell={(0, 0): [jugador, llave_en_mano]},
+        origin_x=0,
+        origin_y=0,
+        tile_size=1,
+        player_has_key=True,
+    )
+
+    world = world_from_state(state)
+
+    assert world.has_key is True
+    assert (0, 0) not in world.keys
+
+
+def test_world_has_key_fallback_por_conteo():
+    """
+    Sin la senal visual (fixtures de test, sprite indeterminado) sigue
+    valiendo el conteo: mas puertas cerradas que llaves sueltas => el
+    personaje lleva la que falta.
+    """
+    grid = np.ones((3, 3), dtype=np.uint8)
+    state = GameState(
+        grid=grid,
+        graph_nodes=set(),
+        adjacency={},
+        player_cell=(0, 0),
+        objects=[DetectedObject("door_key", 2, 2, 1, 1)],
+        objects_by_cell={(2, 2): [DetectedObject("door_key", 2, 2, 1, 1)]},
+        origin_x=0,
+        origin_y=0,
+        tile_size=1,
+    )
+
+    world = world_from_state(state)
+
+    assert world.has_key is True
+    assert world.doors == frozenset({(2, 2)})
