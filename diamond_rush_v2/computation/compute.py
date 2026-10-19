@@ -162,6 +162,11 @@ class World:
     exit_unlocked: bool = False
     nodes: FrozenSet[Cell] = frozenset()
     adjacency: Dict[Cell, List[Cell]] = field(default_factory=dict)
+    # Pares (boton, reja) contiguos donde el fallo del juego permite pasar
+    # del boton a la reja aunque esta se cierre al soltar el boton (ver
+    # _estado_valido). Vacio salvo en los niveles declarados en
+    # button_gate.GATE_GLITCH.
+    glitch: FrozenSet[Tuple[Cell, Cell]] = frozenset()
 
     def in_bounds(self, cell: Cell) -> bool:
         return 0 <= cell[0] < self.rows and 0 <= cell[1] < self.cols
@@ -223,6 +228,7 @@ def world_from_state(
     state: GameState,
     roles: Optional[Dict[str, str]] = None,
     level: Optional[int] = None,
+    knowledge=None,
 ) -> World:
     """
     Traduce el GameState percibido (grid + detecciones) al World de
@@ -236,6 +242,11 @@ def world_from_state(
     button_gate.py; sin el se empareja por cercania (ver
     _button_gate_map). Tambien habilita la secuencia de subobjetivos de
     level_hints.py (`World.hints`), validada contra lo percibido.
+
+    `knowledge` (computation.gates.GateKnowledge, opcional) devuelve al
+    mundo lo que un frame suelto pierde: los botones cubiertos y las rejas
+    abiertas (ver ese modulo), el emparejamiento aprendido al pisar botones
+    y los pares donde vale el fallo del juego.
     """
     roles = roles or ROLES
     grid = state.grid.tolist()
@@ -281,7 +292,22 @@ def world_from_state(
         elif role == "exit":
             exit_cell = cell
 
-    return World(
+    learned: Dict[Cell, Cell] = {}
+    glitch: FrozenSet[Tuple[Cell, Cell]] = frozenset()
+    if knowledge is not None:
+        # Lo estatico recordado se une a lo visto. Las rejas entran como
+        # cerradas: quien decide cuales estan abiertas es _collect, a partir
+        # de que botones estan cubiertos (personaje o roca).
+        buttons |= knowledge.buttons
+        gates |= knowledge.gates
+        learned = dict(knowledge.learned)
+        glitch = frozenset(
+            (b, g)
+            for b, g in knowledge.active_glitch().items()
+            if b in buttons and g in gates
+        )
+
+    world = World(
         rows=rows,
         cols=cols,
         walls=frozenset(walls),
@@ -293,7 +319,7 @@ def world_from_state(
         gates=frozenset(gates),
         all_gates=frozenset(gates),
         buttons=frozenset(buttons),
-        button_gate=_button_gate_map(level, buttons, gates),
+        button_gate=_button_gate_map(level, buttons, gates, learned),
         hints=_hints_from_level(level, grid, holes, buttons, keys, doors, diamonds),
         doors=frozenset(doors),
         keys=frozenset(keys),
@@ -307,11 +333,18 @@ def world_from_state(
         exit_unlocked=False,
         nodes=frozenset(state.graph_nodes),
         adjacency=state.adjacency,
+        glitch=glitch,
     )
+    # Con memoria hay que fijar ya el estado dinamico de las rejas (una reja
+    # recordada arranca "cerrada" aunque el personaje este sobre su boton).
+    return _collect(world) if knowledge is not None else world
 
 
 def _button_gate_map(
-    level: Optional[int], buttons: Set[Cell], gates: Set[Cell]
+    level: Optional[int],
+    buttons: Set[Cell],
+    gates: Set[Cell],
+    learned: Optional[Dict[Cell, Cell]] = None,
 ) -> Dict[Cell, Cell]:
     """
     Emparejamiento boton->reja 1:1.
@@ -322,10 +355,21 @@ def _button_gate_map(
     para ese nivel) todo se resuelve por cercania. La validacion de
     celdas evita aplicar un mapeo si el nivel percibido no coincide con
     el declarado.
+
+    `learned` (lo observado al pisar botones en ejecucion) manda sobre lo
+    declarado a mano: es evidencia del juego real.
     """
-    explicito = (
+    explicito = dict(
         button_gate.BUTTON_GATE.get(level, {}) if level is not None else {}
     )
+    for b, g in (learned or {}).items():
+        # Lo observado desplaza cualquier entrada declarada que choque con el
+        # (mismo boton o misma reja): el emparejamiento sigue siendo 1:1, y lo
+        # que quede sin pareja se completa por cercania mas abajo.
+        explicito = {
+            bb: gg for bb, gg in explicito.items() if bb != b and gg != g
+        }
+        explicito[b] = g
     mapping = {b: g for b, g in explicito.items() if b in buttons and g in gates}
     pendientes_b = buttons - set(mapping)
     pendientes_g = gates - set(mapping.values())
@@ -510,17 +554,24 @@ def _leave_spike(world: World, origin: Cell) -> World:
     )
 
 
-def _estado_valido(world: World) -> bool:
+def _estado_valido(world: World, origin: Optional[Cell] = None) -> bool:
     """
     True si el mundo resultante de un paso es fisicamente coherente: ni
     el personaje ni una roca pueden quedar sobre una reja CERRADA. Con
     rejas temporales al salir de un boton la reja se cierra, asi que no
     vale "colarse" a la casilla de la reja en el mismo paso (entrar
     exigia tener el boton pisado, que el propio movimiento ya no deja).
+
+    UNICA excepcion: el fallo del juego (`world.glitch`). Pasar DIRECTAMENTE
+    del boton a su reja contigua mientras esta abierta es posible en el
+    juego real aunque la reja se cierre al soltar el boton; el personaje
+    queda dentro de la reja y sigue de largo (ver button_gate.GATE_GLITCH).
+    `origin` es la celda de la que sale el personaje en este paso.
     """
     collected = _collect(world)
     if collected.player in collected.gates:
-        return False
+        if origin is None or (origin, collected.player) not in world.glitch:
+            return False
     if collected.rocks & collected.gates:
         return False
     return True
@@ -613,7 +664,7 @@ def _step(
         return Action("push", direction), nuevo
     else:
         nuevo = _leave_spike(replace(world, player=target), origin)
-        if not _estado_valido(nuevo):
+        if not _estado_valido(nuevo, origin):
             return None
         return Action("move", direction), nuevo
 
@@ -1438,7 +1489,30 @@ class Planner:
             for name, goals, _rock in current.hints
         ):
             return self._plan_fallback(world)
-        actions: List[Action] = []
+        if config.ROCK_MACRO_FIRST:
+            macro = self._plan_con_macro(world, current)
+            if macro is not None:
+                return macro
+        base = self._solve(world, current, [])
+        if base is not None and base.complete:
+            return base
+        # El A* global no dio plan completo: antes del respaldo clasico se
+        # prueba dejar una roca sobre el boton (nivel de un solo boton).
+        if not config.ROCK_MACRO_FIRST:
+            macro = self._plan_con_macro(world, current)
+            if macro is not None:
+                return macro
+        return base if base is not None else self._plan_fallback(world)
+
+    def _solve(
+        self, world: World, current: World, actions: List[Action]
+    ) -> Optional[Plan]:
+        """
+        Busqueda global (diamantes) + salida desde `current`, anteponiendo
+        `actions` (los pasos ya dados para llegar a `current`). Devuelve None
+        cuando el comportamiento original era caer en _plan_fallback.
+        """
+        actions = list(actions)
         if current.diamonds:
             result = a_star(
                 current,
@@ -1447,7 +1521,7 @@ class Planner:
                 success=lambda w: not w.diamonds,
             )
             if result is None:
-                return self._plan_fallback(world)
+                return None
             steps, current = result
             actions.extend(steps)
         # La salida solo es meta con 0 diamantes (ya desbloqueada).
@@ -1469,7 +1543,7 @@ class Planner:
                 # Sin diamantes que recolectar, el fallback entero solo
                 # persigue la salida (incluye el macro de hoyos).
                 if not world.diamonds:
-                    return self._plan_fallback(world)
+                    return None
                 pending.append("salida")
             else:
                 steps, current = result
@@ -1481,6 +1555,47 @@ class Planner:
             pending=pending,
             initial_world=world,
         )
+
+    def _macro_roca_en_boton(
+        self, world: World
+    ) -> Optional[Tuple[List[Action], World]]:
+        """
+        Nivel de UN solo boton: llevar una roca encima y dejarla ahi.
+
+        Con una reja temporal, pisar el boton no sirve para cruzar la
+        reja y volver (se cierra al soltarlo); solo una roca encima la
+        mantiene abierta. El A* global con peso 2 no tiene incentivo para
+        ese rodeo (su heuristica solo mira la distancia a los diamantes),
+        asi que se hace explicito como subobjetivo. Seguro: no activa
+        picos ni tapa diamantes.
+        """
+        if len(world.buttons) != 1 or not world.rocks:
+            return None
+        (button,) = world.buttons
+        if button in world.rocks:
+            return None  # ya hay una roca encima
+        gate = world.button_gate.get(button)
+        if gate is not None and (button, gate) in world.glitch:
+            return None  # el fallo del juego ahorra la roca
+        if not _reja_bloquea(world, button):
+            return None  # boton decorativo: no vale gastar una roca
+        return a_star(
+            world,
+            frozenset({button}),
+            config.MAX_NODES_MACRO,
+            success=lambda w: button in w.rocks,
+            allow_spike_activation=False,
+            allow_rock_on_diamond=False,
+        )
+
+    def _plan_con_macro(self, world: World, current: World) -> Optional[Plan]:
+        """Plan completo que empieza con la roca sobre el boton, o None."""
+        macro = self._macro_roca_en_boton(current)
+        if macro is None:
+            return None
+        steps, after = macro
+        plan = self._solve(world, after, steps)
+        return plan if plan is not None and plan.complete else None
 
     def _plan_fallback(self, world: World) -> Plan:
         # Composicion clasica de subobjetivos (respaldo de la busqueda

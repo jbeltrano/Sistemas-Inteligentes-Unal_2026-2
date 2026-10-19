@@ -73,3 +73,29 @@ BUTTON_GATE: Dict[int, Dict[Cell, Cell]] = {
         },
     # ------------------------------------------------------------------
 }
+
+
+# ----------------------------------------------------------------------
+# Fallo del juego: colarse por la reja contigua al boton.
+#
+# En estos pares el boton esta pegado a su reja: pisando el boton la reja
+# se abre, y si desde ahi se manda al personaje hacia la reja, entra antes
+# de que se cierre (no hace falta dejar una roca encima del boton).
+#
+# Formato (igual que BUTTON_GATE, pero SOLO los pares donde el fallo se
+# haya comprobado en el juego):
+#
+#     GATE_GLITCH[nivel] = {(fila_boton, col_boton): (fila_reja, col_reja)}
+#
+# El planificador solo lo usa en los niveles listados aqui y, si en
+# ejecucion el personaje no termina en la reja, lo desactiva para el resto
+# de la corrida y re-planifica sin el.
+#
+# `computation.gates.glitch_candidates()` lista los pares contiguos de
+# BUTTON_GATE como pista para buscar el "otro nivel" con el mismo fallo.
+# ----------------------------------------------------------------------
+GATE_GLITCH: Dict[int, Dict[Cell, Cell]] = {
+    19: {(5, 2): (5, 1)},
+    # Candidato (sale contiguo en las pistas de arriba; sin comprobar):
+    # 13: {(7, 5): (7, 4)},
+}

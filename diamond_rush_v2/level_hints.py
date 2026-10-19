@@ -72,6 +72,8 @@ LEVEL_SEQUENCE: Dict[int, List[tuple]] = {
         ("llave", (4, 8)),
         ("puerta", (10, 2)),
         ("roca", (4, 7), (11, 1)),
+        ("llave", (13, 4)),
+        ("puerta", (8, 5)),
     ],
     # ------------------------------------------------------------------
     # Nivel 10: PENDIENTE de calibrar. El solver actual no rellena (8,7)
@@ -79,6 +81,11 @@ LEVEL_SEQUENCE: Dict[int, List[tuple]] = {
     # inalcanzable. Completar tras revisar el nivel real con `--debug`
     # o `recognize` sobre assets/levels/level10.png. Plantilla:
     10: [
+        ("roca", (12, 3), (8, 2)),
+        ("roca", (12, 4), (8, 7)),
+        
+    ],
+    11: [
         ("roca", (12, 3), (8, 2)),
         ("roca", (12, 4), (8, 7)),
         
