@@ -5,7 +5,10 @@ Problema que resuelve: la percepcion es "sin memoria" (un frame -> un
 GameState) y, justo cuando importa, pierde informacion:
 
   - un boton CUBIERTO (personaje o roca encima) deja de detectarse como
-    `button`;
+    `button`; si es el PRIMER frame del nivel (p. ej. el tester dejo al
+    jugador sobre el boton antes de correr el agente), ni siquiera hay
+    un frame anterior donde se viera: se reconstruye a partir de la
+    reja abierta que su boton deja (ver _infer_pressed);
   - una reja ABIERTA se detecta como `open_gate`, y world_from_state la
     trata como piso (rol "floor"), asi que se olvida que existia y que
     se vuelve a cerrar al soltar su boton.
@@ -63,6 +66,13 @@ class GateKnowledge:
         positivo del template matching quedaria como boton fantasma para
         siempre. Los botones y rejas no se mueven, asi que un solo frame
         sin nada encima basta.
+
+        El hueco que llena: un boton CUBIERTO (por el personaje o por una
+        roca, p. ej. si el tester dejo al jugador sobre el antes de correr
+        el agente) no se detecta, y sin el el planificador trataba su
+        reja como cerrada. Como una reja que se ve ABIERTA solo puede
+        estarlo porque su boton este cubierto, _infer_pressed reconstruye
+        ese par a partir de la reja.
         """
         if self._seeded:
             return
@@ -73,6 +83,62 @@ class GateKnowledge:
                 self.buttons.add(cell)
             elif obj.name in ("closed_gate", "open_gate"):
                 self.gates.add(cell)
+        self._infer_pressed(state)
+
+    def _infer_pressed(self, state: GameState) -> None:
+        """
+        Reconstruye el boton cubierto de una reja que se ve ABIERTA.
+
+        La reja temporal solo esta abierta mientras su boton esta cubierto
+        (el personaje o una roca encima); una reja abierta en el frame
+        IMPLICA que su boton lo esta. Pero un boton cubierto no se
+        detecta, asi que ese par se perdia y el modelo trataba la reja
+        como cerrada (plan incompleto).
+
+        Candidato a boton de la reja abierta G:
+          1. El declarado en button_gate.py para este nivel cuya reja sea
+             G (el confiable con varios pares); se exige que ese boton
+             este realmente cubierto.
+          2. Sin declaracion (o sin entrada para G): solo si es
+             inequivoco -- UNA reja abierta y UNA celda cubierta. Con mas
+             ambiguedad no se infiere nada (el lazo cerrado corrige).
+        Y en ambos casos, consistencia: el candidato debe estar cubierto
+        y no puede ser un boton VISIBLE (un boton descubierto mantendria
+        su reja cerrada, seria inconsistente).
+
+        Solo siembra `buttons`; NO toca `learned`, porque esto es una
+        conjetura a partir del estado inicial, no evidencia observada al
+        pisar un boton (meterlo en `learned` desplazaria un mapeo
+        declarado correcto en _button_gate_map).
+        """
+        abiertas = {
+            state.cell_of(o.center) for o in state.objects_named("open_gate")
+        }
+        if not abiertas:
+            return
+
+        cubiertas = {state.player_cell} | {
+            state.cell_of(o.center) for o in state.objects_named("rock")
+        }
+        visibles = {
+            state.cell_of(o.center) for o in state.objects_named("button")
+        }
+        declarado = (
+            button_gate.BUTTON_GATE.get(self.level, {})
+            if self.level is not None
+            else {}
+        )
+
+        for gate in sorted(abiertas):
+            candidato = next(
+                (b for b, g in declarado.items() if g == gate), None
+            )
+            if candidato is None and len(abiertas) == 1 and len(cubiertas) == 1:
+                # Sin declaracion, unica reja abierta y unica celda
+                # cubierta: no hay otra explicacion posible.
+                candidato = next(iter(cubiertas))
+            if candidato in cubiertas and candidato not in visibles:
+                self.buttons.add(candidato)
 
     # ---------------------------------------------------------------
     # Fallo del juego (colarse por la reja contigua al boton)

@@ -1159,6 +1159,124 @@ def test_verify_every_positivo_si_verifica_botones(monkeypatch):
 
 
 # ---------------------------------------------------------------
+# Reja abierta en el primer frame -> boton cubierto reconstruido
+# ---------------------------------------------------------------
+# GateKnowledge._infer_pressed: una reja que se ve ABIERTA solo puede
+# estarlo porque su boton este cubierto (el personaje o una roca). Si el
+# tester dejo al jugador sobre el boton antes de correr el agente, ese
+# boton no se detecta (tapado por el sprite del jugador) y el modelo
+# trataba la reja como cerrada -> plan incompleto.
+
+
+def _estado_reja_abierta(player, gate, extras=()):
+    """Estado 1xN con el jugador, una reja abierta y objetos extra."""
+    objetos = [
+        DetectedObject("open_gate", gate[1], gate[0], 1, 1),
+        DetectedObject("player", player[1], player[0], 1, 1),
+    ]
+    objetos.extend(extras)
+    grid = np.ones((1, 10), dtype=np.uint8)
+    return GameState(
+        grid=grid,
+        graph_nodes=set(),
+        adjacency={},
+        player_cell=player,
+        objects=objetos,
+        objects_by_cell={},
+        origin_x=0,
+        origin_y=0,
+        tile_size=1,
+    )
+
+
+def test_reja_abierta_siembra_boton_declarado(monkeypatch):
+    """
+    El par declarado en button_gate.py + una reja abierta => el boton
+    cubierto por el jugador se siembra en la memoria y el modelo ve la
+    reja ABIERTA (pressed={(0,0)}), no cerrada.
+    """
+    from computation.gates import GateKnowledge
+
+    monkeypatch.setitem(button_gate.BUTTON_GATE, 97, {(0, 0): (0, 4)})
+    state = _estado_reja_abierta(player=(0, 0), gate=(0, 4))
+    knowledge = GateKnowledge(level=97)
+    knowledge.remember(state)
+
+    world = world_from_state(state, level=97, knowledge=knowledge)
+
+    assert (0, 0) in world.buttons  # reconstruido, aunque no se detecto
+    assert world.pressed == frozenset({(0, 0)})
+    assert (0, 4) not in world.gates  # el modelo la ve abierta
+    assert world.button_gate[(0, 0)] == (0, 4)
+
+
+def test_reja_abierta_declaracion_inconsistente_no_siembra(monkeypatch):
+    """
+    Si el par declarado no cuadra con lo percibido (el boton declarado
+    no esta cubierto) y hay varias celdas cubiertas, NO se infiere nada:
+    el modelo se queda conservador en vez de adivinar mal.
+    """
+    from computation.gates import GateKnowledge
+
+    # (0, 7) no esta cubierta por nadie; ademas hay dos celdas cubiertas
+    # (el jugador (0,0) y la roca (0,2)), asi que el fallback inequivoco
+    # tampoco aplica.
+    monkeypatch.setitem(button_gate.BUTTON_GATE, 96, {(0, 7): (0, 4)})
+    roca = DetectedObject("rock", 2, 0, 1, 1)
+    state = _estado_reja_abierta(
+        player=(0, 0), gate=(0, 4), extras=(roca,)
+    )
+    knowledge = GateKnowledge(level=96)
+    knowledge.remember(state)
+
+    world = world_from_state(state, level=96, knowledge=knowledge)
+
+    assert (0, 7) not in world.buttons
+    assert world.pressed == frozenset()
+    assert (0, 4) in world.gates  # sigue cerrada en el modelo
+
+
+def test_reja_abierta_sin_declaracion_inequivoca():
+    """
+    Sin entrada declarada, una unica reja abierta y una unica celda
+    cubierta (el jugador) no admite otra explicacion: se siembra.
+    """
+    from computation.gates import GateKnowledge
+
+    state = _estado_reja_abierta(player=(0, 0), gate=(0, 4))
+    knowledge = GateKnowledge(level=None)
+    knowledge.remember(state)
+
+    world = world_from_state(state, knowledge=knowledge)
+
+    assert (0, 0) in world.buttons
+    assert world.pressed == frozenset({(0, 0)})
+    assert (0, 4) not in world.gates
+
+
+def test_boton_visible_no_genera_inferencia(monkeypatch):
+    """
+    Un boton VISIBLE no puede ser el de una reja abierta (si estuviera
+    descubierto, su reja se cerraria): la inferencia lo descarta y no
+    siembra ningun boton fantasma. El boton visible entra por la
+    deteccion normal, no por la inferencia.
+    """
+    from computation.gates import GateKnowledge
+
+    monkeypatch.setitem(button_gate.BUTTON_GATE, 95, {(0, 2): (0, 4)})
+    boton_visible = DetectedObject("button", 2, 0, 1, 1)  # celda (0, 2)
+    state = _estado_reja_abierta(
+        player=(0, 0), gate=(0, 4), extras=(boton_visible,)
+    )
+    knowledge = GateKnowledge(level=95)
+    knowledge.remember(state)
+
+    # Solo el boton visible (deteccion normal); el jugador (0,0) no se
+    # siembra como boton por la reja abierta.
+    assert knowledge.buttons == {(0, 2)}
+
+
+# ---------------------------------------------------------------
 # Pistas de subobjetivos por nivel (level_hints.py)
 # ---------------------------------------------------------------
 def test_world_from_state_inyecta_hints(monkeypatch):
