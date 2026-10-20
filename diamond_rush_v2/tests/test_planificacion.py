@@ -890,6 +890,41 @@ def test_nivel6_plan_completo(plan_nivel6):
     assert final == plan.final_world
 
 
+def test_nivel6_con_hints_usa_picos_puente():
+    """
+    Con las pistas de nivel (level_hints.LEVEL_SEQUENCE[6]) la cadena
+    resuelve el hoyo (11,1) por el planificador de empujes cruzando el
+    pico (10,7) como "puente" (la pista de roca y el diamante (9,2)
+    recogido antes lo permiten), en vez del A* de celdas. El plan queda
+    completo y baja de decenas de segundos a unos pocos.
+    """
+    import time
+
+    from computation.compute import _hints_from_level
+
+    world = _nivel6()
+    grid = [[0] * 10 for _ in range(15)]
+    for (r, c) in world.nodes:
+        grid[r][c] = 1
+    hints = _hints_from_level(
+        6, grid, set(world.holes), set(world.buttons),
+        set(world.keys), set(world.doors), set(world.diamonds),
+    )
+    assert any(name.startswith("hoyo") for name, _g, _r in hints)
+    world = replace(world, hints=hints)
+
+    t0 = time.time()
+    plan = Planner().plan(world)
+    dt = time.time() - t0
+
+    assert plan.complete, plan.pending
+    assert dt < 15.0  # muy por debajo del A* de celdas con el hoyo (11,1)
+    final = simulate(world, plan.actions)
+    assert (11, 1) not in final.holes  # rellenado por un empuje
+    assert not final.diamonds
+    assert final.player == world.exit
+
+
 def test_nivel6_roca_no_tapa_diamante(plan_nivel6):
     """
     En ningun momento del plan queda una roca sobre un diamante sin

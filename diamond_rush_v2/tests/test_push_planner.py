@@ -297,3 +297,81 @@ def test_planner_resuelve_salida_con_roca():
     assert plan.complete
     final = simulate(world, plan.actions)
     assert final.player == (1, 0)
+
+
+def test_pico_puente_permite_caminata_pero_no_por_defecto():
+    """
+    El unico camino al lado del empuje cruza un pico (0,1). En modo seguro
+    el pico es muro y no hay plan; con `allow_bridge_spikes` el personaje
+    lo cruza (queda activado) y rellena el hoyo.
+    """
+    world = World(
+        rows=1,
+        cols=6,
+        player=(0, 0),
+        rocks=frozenset({(0, 3)}),
+        spikes=frozenset({(0, 1)}),
+        holes=frozenset({(0, 5)}),
+    )
+    # Seguro: el pico bloquea el paso al lado izquierdo de la roca.
+    assert push_a_star(world, (0, 5)) is None
+    # Con picos puente: cruza el pico y empuja la roca al hoyo.
+    result = push_a_star(world, (0, 5), allow_bridge_spikes=True)
+    assert result is not None
+    actions, final = result
+    assert (0, 5) not in final.holes  # hoyo rellenado
+    replayed = simulate(world, actions)
+    assert (0, 5) not in replayed.holes
+
+
+def test_pico_puente_nunca_empuja_una_roca_sobre_un_pico():
+    """
+    Aunque el personaje pueda cruzar un pico, una ROCA no puede quedar
+    encima de uno (activaria el pico con algo que no puede salir).
+    """
+    # La roca (0,1) tendria que ir al hoyo (0,4) cruzando el pico (0,3):
+    # al empujarla sobre (0,3) quedaria atrapada ahi -> sin plan.
+    world = World(
+        rows=1,
+        cols=6,
+        player=(0, 0),
+        rocks=frozenset({(0, 1)}),
+        spikes=frozenset({(0, 3)}),
+        holes=frozenset({(0, 4)}),
+    )
+    assert push_a_star(world, (0, 4), allow_bridge_spikes=True) is None
+
+
+def test_pico_puente_rechaza_si_aisla_una_meta():
+    """
+    Con `keep_reachable`, cruzar un pico que aislaria una meta pendiente se
+    rechaza (None); si la meta sigue alcanzable, el plan vale.
+    """
+    world = World(
+        rows=1,
+        cols=6,
+        player=(0, 0),
+        rocks=frozenset({(0, 3)}),
+        spikes=frozenset({(0, 1)}),
+        holes=frozenset({(0, 5)}),
+    )
+    # Cruzar (0,1) deja (0,0), la meta pendiente, inalcanzable.
+    assert (
+        push_a_star(
+            world,
+            (0, 5),
+            allow_bridge_spikes=True,
+            keep_reachable=frozenset({(0, 0)}),
+        )
+        is None
+    )
+    # Una meta al otro lado del pico sigue alcanzable: el plan vale.
+    assert (
+        push_a_star(
+            world,
+            (0, 5),
+            allow_bridge_spikes=True,
+            keep_reachable=frozenset({(0, 4)}),
+        )
+        is not None
+    )

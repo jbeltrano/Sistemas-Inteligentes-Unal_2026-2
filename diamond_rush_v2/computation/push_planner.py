@@ -4,7 +4,7 @@ Planificador de empujes (Sokoban) para los subobjetivos de roca.
 El A* de `computation.compute` busca en el espacio de celdas: cada paso
 del personaje es un nodo, y para rellenar un hoyo o dejar una roca sobre
 un boton explora miles de caminatas por casillas hasta dar con la
-secuencia de empujes (el nivel 6 gasta ~15 s en rellenar (11,1)). Este
+secuencia de empujes (el nivel 6 gastaba ~15 s en rellenar (11,1)). Este
 modulo planifica a nivel de EMPUJES, que es como se piensa un Sokoban:
 
 - Estado: posicion de las rocas + region ALCANZABLE del personaje. El
@@ -25,8 +25,12 @@ respaldo cuando este modulo devuelve None.
 Alcance CONSERVADOR (seguridad): se aplica en modo seguro, igual que la
 primera pasada del fallback:
 
-- Los picos (`world.spikes`) se tratan como muros: nunca se activan (y
-  en la realidad tampoco se pueden pisar, por eso no se cruzan).
+- Los picos (`world.spikes`) se tratan como muros: por defecto nunca se
+  activan. Unica excepcion, opt-in con `allow_bridge_spikes=True` y solo
+  desde un subobjetivo declarado por pista: el PERSONAJE (nunca una roca)
+  puede cruzar un pico "puente" para llegar al lado del empuje (nivel 6:
+  la roca hacia (11,1) exige cruzar (10,7)); el pico queda activado y
+  `keep_reachable` rechaza el plan si eso aisla una meta pendiente.
 - Rejas y botones temporales se tratan como muros: este modulo no simula
   su apertura temporal (romper el invariante de rejas podria dar un plan
   invalido). Los niveles que lo exijan caen al A* de celdas.
@@ -56,7 +60,11 @@ _DELTA_TO_NAME = {
 }
 
 
-def _static_floor(world: World, include_exit: bool = False) -> FrozenSet[Cell]:
+def _static_floor(
+    world: World,
+    include_exit: bool = False,
+    allow_bridge_spikes: bool = False,
+) -> FrozenSet[Cell]:
     """
     Celdas por las que caminar en modo seguro: muros, picos (no se
     cruzan), rejas temporales (no se simula su apertura), hoyos (bloquean
@@ -69,9 +77,17 @@ def _static_floor(world: World, include_exit: bool = False) -> FrozenSet[Cell]:
     Con `include_exit=True` la celda de salida cuenta como piso: es el caso
     del modo "el personaje alcanza la salida" (nivel 20), donde la salida
     bloqueada por rocas es justamente la meta.
+
+    Con `allow_bridge_spikes=True` los picos cuentan como piso para el
+    PERSONAJE (un "pico puente": la unica entrada a una zona). El
+    single-crossing y la seguridad de aislamiento los vigilan
+    `_compute_reach` y `_reachable_bridge_ok`; una roca nunca pisa un pico
+    (`_rock_dest_ok`).
     """
-    blocked = set(world.walls) | set(world.spikes) | set(world.holes)
-    blocked |= set(world.all_gates) | set(world.gates)
+    blocked = set(world.walls) | set(world.holes) | set(world.all_gates)
+    blocked |= set(world.gates)
+    if not allow_bridge_spikes:
+        blocked |= set(world.spikes)
     if world.exit is not None and not world.exit_unlocked and not include_exit:
         blocked.add(world.exit)
     if not world.has_key:
@@ -84,6 +100,52 @@ def _static_floor(world: World, include_exit: bool = False) -> FrozenSet[Cell]:
         for c in range(world.cols)
         if (r, c) not in blocked
     )
+
+
+def _reachable_bridge_ok(
+    world: World,
+    start: Cell,
+    crossed_spikes: FrozenSet[Cell],
+    keep_reachable: FrozenSet[Cell],
+) -> bool:
+    """
+    Seguridad de picos puente: activar `crossed_spikes` (los que el plan
+    realmente cruza) los convierte en muro permanente, asi que solo se
+    permite si eso NO deja aislada ninguna meta pendiente
+    (`keep_reachable`).
+
+    El juicio es de TOPOLOGIA FISICA "pelada" (como `_reachable_bare` en
+    compute.py): se ignoran puertas, hoyos, rejas y rocas (que pueden
+    despejarse o rellenarse), respetando muros y restando SOLO los picos
+    cruzados. Asi una meta detras de una puerta aun cerrada no cuenta como
+    aislada.
+    """
+    if not keep_reachable:
+        return True
+    free: Set[Cell] = (
+        set(world.nodes)
+        if world.nodes
+        else {
+            (r, c)
+            for r in range(world.rows)
+            for c in range(world.cols)
+            if (r, c) not in world.walls
+        }
+    )
+    free -= set(crossed_spikes)  # picos activados = muro
+    if start not in free:
+        return False
+    seen: Set[Cell] = {start}
+    queue = deque([start])
+    while queue:
+        cell = queue.popleft()
+        for dr, dc in _NEIGHBOR_DELTAS:
+            nxt = (cell[0] + dr, cell[1] + dc)
+            if nxt in free and nxt not in seen:
+                seen.add(nxt)
+                queue.append(nxt)
+    return keep_reachable <= seen
+
 
 
 def _compute_reach(
@@ -111,11 +173,13 @@ def _compute_reach(
 def _rock_dest_ok(world: World, floor: FrozenSet[Cell], dest: Cell) -> bool:
     """
     Una roca puede terminar en `dest`: una celda de `floor` libre, o un
-    hoyo abierto (lo rellena). Nunca sobre un diamante (lo taparia) ni
-    sobre una salida aun bloqueada (el modo "alcanzar la salida" la mete
-    en `floor` para el personaje, pero una roca encima taparia la meta).
+    hoyo abierto (lo rellena). Nunca sobre un diamante (lo taparia), sobre
+    una salida aun bloqueada (el modo "alcanzar la salida" la mete en
+    `floor` para el personaje, pero una roca encima taparia la meta) ni
+    sobre un pico (aunque un "pico puente" este en `floor` para el
+    personaje, una roca jamas lo pisa).
     """
-    if dest in world.diamonds:
+    if dest in world.diamonds or dest in world.spikes:
         return False
     if dest in world.holes:
         return True
@@ -266,6 +330,8 @@ def push_a_star(
     max_nodes: int = config.MAX_NODES_PUSH,
     weight: float = 1.0,
     goal_player_reaches: bool = False,
+    allow_bridge_spikes: bool = False,
+    keep_reachable: FrozenSet[Cell] = frozenset(),
 ) -> Optional[Tuple[List[Action], World]]:
     """
     Planifica por empujes hasta que una roca quede sobre `rock_target`
@@ -280,13 +346,22 @@ def push_a_star(
     (tipico de una salida bloqueada por rocas, nivel 20). El plan termina
     con la caminata del personaje hasta `rock_target`.
 
+    Con `allow_bridge_spikes=True` el personaje puede cruzar un "pico
+    puente" (la unica entrada a una zona de la meta): el pico se trata como
+    piso, pero una roca jamas lo pisa y el cruce es de un solo uso
+    (validado en `_reconstruct`). `keep_reachable` lista metas pendientes
+    que NO deben quedar aisladas al activar el pico: si cruzarlo las aisla,
+    el plan se rechaza.
+
     `final_world` es un `World` con las rocas ya movidas (y los hoyos
     rellenados), para encadenar el resto de la cadena de subobjetivos.
     """
     if not goal_player_reaches and rock_target in world.rocks:
         return [], world
 
-    floor0 = _static_floor(world, include_exit=goal_player_reaches)
+    floor0 = _static_floor(
+        world, include_exit=goal_player_reaches, allow_bridge_spikes=allow_bridge_spikes
+    )
     if world.player not in floor0 and world.player not in world.rocks:
         return None
 
@@ -354,7 +429,14 @@ def push_a_star(
 
         if goal(node):
             return _reconstruct(
-                world, states, edges, idx, goal_player_reaches, rock_target
+                world,
+                states,
+                edges,
+                idx,
+                goal_player_reaches,
+                rock_target,
+                allow_bridge_spikes,
+                keep_reachable,
             )
 
         ng = g + 1
@@ -387,12 +469,21 @@ def _reconstruct(
     idx: int,
     goal_player_reaches: bool = False,
     final_target: Optional[Cell] = None,
-) -> Tuple[List[Action], World]:
+    allow_bridge_spikes: bool = False,
+    keep_reachable: FrozenSet[Cell] = frozenset(),
+) -> Optional[Tuple[List[Action], World]]:
     """
     Arma el plan: por cada empuje (de atras hacia adelante) reconstruye
     la caminata del personaje hasta `player_side` y luego el `push`.
     Con `goal_player_reaches`, termina con la caminata del personaje
     hasta `final_target` (la celda meta, p. ej. la salida).
+
+    Con `allow_bridge_spikes`, un pico que la caminata cruce queda
+    activado (sale de `floor`): si una caminata posterior necesitara un
+    pico ya cruzado, `_walk_path` falla y el plan se rechaza (single
+    crossing). Ademas, si activar los picos cruzados aisla alguna meta
+    pendiente (`keep_reachable`), el plan se rechaza (seguridad de picos
+    puente).
     """
     chain: List[_Edge] = []
     while edges[idx] is not None:
@@ -404,11 +495,17 @@ def _reconstruct(
     actions: List[Action] = []
     player = world.player
     rocks = frozenset(world.rocks)
-    floor = _static_floor(world, include_exit=goal_player_reaches)
+    floor = _static_floor(
+        world, include_exit=goal_player_reaches, allow_bridge_spikes=allow_bridge_spikes
+    )
+    crossed: Set[Cell] = set()
     for edge in chain:
         path = _walk_path(floor, rocks, player, edge.player_side)
         if path is None:
-            return [], world
+            return None
+        if allow_bridge_spikes:
+            crossed |= set(path) & set(world.spikes)
+            floor = _cross_spikes(world, floor, path)
         actions.extend(_cells_to_actions(path))
         delta = (edge.dest[0] - edge.rock[0], edge.dest[1] - edge.rock[1])
         actions.append(Action("push", _DELTA_TO_NAME[delta]))
@@ -424,15 +521,47 @@ def _reconstruct(
         final_floor = floor | set(rocks) | {player}
         path = _walk_path(final_floor, rocks, player, final_target)
         if path is None:
-            return [], world
+            return None
+        if allow_bridge_spikes:
+            crossed |= set(path) & set(world.spikes)
+            floor = _cross_spikes(world, floor, path)
         actions.extend(_cells_to_actions(path))
         player = final_target
+    # Seguridad de picos puente: si activar los picos cruzados aisla alguna
+    # meta pendiente desde donde QUEDA el personaje, el plan se rechaza. Se
+    # valida al final (con la posicion final), porque es ahi desde donde el
+    # resto de la cadena debe seguir alcanzando sus metas.
+    if allow_bridge_spikes and crossed and not _reachable_bridge_ok(
+        world, player, frozenset(crossed), keep_reachable
+    ):
+        return None
     # El personaje termina sobre la celda de la roca del ultimo empuje
     # (`player` ya quedo ahi). Se refleja en `final_world` para que la
-    # cadena de subobjetivos parta de la posicion correcta.
+    # cadena de subobjetivos parta de la posicion correcta. Los picos
+    # cruzados quedaron ACTIVADOS (muro permanente): se reflejan como wall
+    # para que la cadena no planifique volver a cruzarlos.
     return actions, _world_with(
-        world, rocks=rocks, holes=_holes_left(world, floor), player=player
+        world,
+        rocks=rocks,
+        holes=_holes_left(world, floor),
+        player=player,
+        walls=world.walls | crossed,
+        spikes=world.spikes - crossed,
     )
+
+
+def _cross_spikes(
+    world: World, floor: FrozenSet[Cell], path: List[Cell]
+) -> FrozenSet[Cell]:
+    """
+    Un pico de `world.spikes` que el `path` pise queda activado (muro):
+    se quita de `floor`. Modela el single-crossing (un pico cruzado no se
+    vuelve a cruzar).
+    """
+    crossed = set(path) & set(world.spikes)
+    if not crossed:
+        return floor
+    return frozenset(floor - crossed)
 
 
 def _holes_left(world: World, floor: FrozenSet[Cell]) -> FrozenSet[Cell]:

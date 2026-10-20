@@ -66,8 +66,10 @@ MAX_DEPTH = 900                # tope de profundidad del retroceso
 # en los puzzles tipo Sokoban de los niveles finales.
 A_STAR_WEIGHT = 2.0
 # Presupuesto de A* para subobjetivos de relleno de hoyo (locales). El
-# nivel 6 exige ~200k nodos para rellenar (11,1) con la puerta abierta,
-# asi que 60k no alcanzaba ni con la mecanica resuelta.
+# nivel 6 exige ~200k nodos para rellenar (11,1) con la puerta abierta si
+# cae al A* de celdas (sin pista); con la pista de nivel + picos puente lo
+# resuelve el planificador de empujes en ms, pero 60k no alcanzaba ni con
+# la mecanica resuelta.
 MAX_NODES_HOLE = 250_000
 
 # ---------------------------------------------------------------

@@ -1832,6 +1832,7 @@ class Planner:
             name: str,
             goals: FrozenSet[Cell],
             success: Callable[[World], bool],
+            keep_reachable: FrozenSet[Cell] = frozenset(),
         ) -> Optional[Tuple[List[Action], World]]:
             """
             Intenta resolver el subobjetivo con el planificador de empujes
@@ -1839,6 +1840,12 @@ class Planner:
             encima: hoyos, botones temporales y waypoints de roca. El
             `success` del subobjetivo decide si el destino es justo la
             celda meta; `_push_target` valida el destino.
+
+            `keep_reachable` son las metas pendientes que no deben quedar
+            aisladas: habilita los "picos puente" (cruzar un pico que es la
+            unica entrada a la zona de la meta) SOLO cuando el subobjetivo
+            esta declarado en una pista de nivel (`world.hints`), contexto
+            dirigido y ya revalidado contra lo percibido.
             """
             target = _push_target(current, name, goals, success)
             if target is None:
@@ -1848,7 +1855,20 @@ class Planner:
             # seria circular.
             from computation.push_planner import push_a_star
 
-            result = push_a_star(world_actual, target, config.MAX_NODES_PUSH)
+            # Picos puente solo en subobjetivos declarados por pista: el
+            # contexto dirigido justifica relajar la seguridad estricta de
+            # picos, y el propio push_planner verifica que el cruce no
+            # aisle `keep_reachable`.
+            bridge = any(
+                hint_name == name for hint_name, _g, _r in current.hints
+            )
+            result = push_a_star(
+                world_actual,
+                target,
+                config.MAX_NODES_PUSH,
+                allow_bridge_spikes=bridge,
+                keep_reachable=keep_reachable,
+            )
             if result is None:
                 return None
             # El mundo final del push_planner es coherente con el del A*:
@@ -1935,7 +1955,7 @@ class Planner:
                     # aplica o no encuentra, se sigue con A*/retroceso.
                     if not spikes and not rocks:
                         result = _push_para_subobjetivo(
-                            current, name, goals, success
+                            current, name, goals, success, keep_reachable
                         )
                         if result is not None:
                             return result
@@ -2064,8 +2084,16 @@ class Planner:
             # global puede caber ahora en el presupuesto. El objetivo
             # incluye la salida si ya esta desbloqueada, para no quedar
             # atrapado en una region tras recolectar todo.
+            #
+            # Se omite en el orden chain-first (TRY_GLOBAL_ASTAR_FIRST
+            # False): ahi la cadena es el camino principal y, si deja metas
+            # pendientes, `plan()` ya reintenta el A* global con el nivel
+            # completo como ultimo recurso. Mantener este reintento intra-
+            # cadena duplicaba el A* de 400k (nivel 6: ~28 s quemados que
+            # fallaban igual).
             if (
-                global_retries < 2
+                config.TRY_GLOBAL_ASTAR_FIRST
+                and global_retries < 2
                 and current.diamonds
                 and (
                     len(current.doors) < len(world.doors)

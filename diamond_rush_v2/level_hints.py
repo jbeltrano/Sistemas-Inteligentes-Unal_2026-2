@@ -71,6 +71,7 @@ LEVEL_SEQUENCE: Dict[int, List[tuple]] = {
     6: [
         ("llave", (4, 8)),
         ("puerta", (10, 2)),
+        ("diamante", (9, 2)),
         ("roca", (4, 7), (11, 1)),
         ("llave", (13, 4)),
         ("puerta", (8, 5)),
@@ -88,7 +89,11 @@ LEVEL_SEQUENCE: Dict[int, List[tuple]] = {
     11: [
         ("llave", (3, 1)),
         ("roca", (10, 1), (12, 1)),
-        ("roca", (12, 5), (9, 5)),
+        ("roca", (11, 5), (11, 7)),
+        ("puerta", (13,4)),
+        ("roca",(12,5),(9,5)),
+        ("llave",(9,8)),
+        ("puerta",(13, 6)),
         
     ],
     15: [
