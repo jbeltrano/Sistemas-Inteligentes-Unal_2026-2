@@ -3,7 +3,7 @@ python main.py --verify-every 0
 python main.py --verify-every 0
 python main.py --verify-every 0
 python main.py --verify-every 0
-python main.py --verify-every 0
+python main.py --verify-every 0 --level 6
 python main.py --verify-every 0
 python main.py --verify-every 0 --level 8
 python main.py --verify-every 0 --level 9
