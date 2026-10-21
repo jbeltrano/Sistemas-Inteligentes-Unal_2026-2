@@ -87,14 +87,11 @@ LEVEL_SEQUENCE: Dict[int, List[tuple]] = {
         
     ],
     11: [
-        ("llave", (3, 1)),
-        ("roca", (10, 1), (12, 1)),
-        ("roca", (11, 5), (11, 7)),
-        ("puerta", (13,4)),
-        ("roca",(12,5),(9,5)),
-        ("llave",(9,8)),
-        ("puerta",(13, 6)),
-        
+        ("llave", (3, 1)),              # 1. Llave primero (área arriba-izq)
+        ("roca", (10, 1), (12, 1)),     # 2. Rellenar hoyo inferior para abrir camino
+        ("roca", (9, 6), (3, 7)),       # 3. Roca sobre el botón (reja permanente)
+        ("diamante", (4, 5)),           # 4. Diamante ahora accesible por la reja abierta
+        # El resto se resuelve con el planificador automático
     ],
     15: [
         ("roca", (10, 5), (10, 6)),

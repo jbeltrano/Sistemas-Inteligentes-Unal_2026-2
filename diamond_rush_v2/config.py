@@ -114,7 +114,7 @@ MAX_NODES_MACRO = 150_000      # presupuesto de A* para llevar la roca al boton
 # busca a nivel de Sokoban (una accion = un empuje, el caminar es
 # implicito). Cada nodo es mucho mas caro que uno de A* de celdas, pero el
 # espacio es ordenes de magnitud menor; 50k sobra de largo.
-MAX_NODES_PUSH = 50_000
+MAX_NODES_PUSH = 200_000
 # Orden de la planificacion. False (por defecto): la CADENA de subobjetivos
 # (hints -> _plan_fallback) es el camino principal y el A* global de 400k
 # nodos queda como ultimo recurso si la cadena deja metas pendientes; con
